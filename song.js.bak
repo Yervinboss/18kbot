@@ -1,0 +1,79 @@
+const yts = require('yt-search');
+const { ytdl } = require('@ybd-project/ytdl-core');
+const fs = require('fs');
+const path = require('path');
+
+module.exports = {
+    name: 'song',
+    aliases: ['music', 'audio', 'mp3'],
+    category: 'music',
+    description: 'Download song from YouTube locally',
+    async execute(sock, m, args) {
+        const chatId = m.key.remoteJid;
+        const query = args.join(' ').trim();
+
+        if (!query) {
+            return sock.sendMessage(chatId, { 
+                text: '· *Song Downloader*\n\nUsage:\n· \\.song <song name | YouTube link>' 
+            }, { quoted: m });
+        }
+
+        let filePath = null;
+
+        try {
+            let videoUrl;
+            let videoTitle = 'song';
+            let thumbnail = null;
+
+            if (query.includes('youtube.com') || query.includes('youtu.be')) {
+                videoUrl = query;
+                const info = await ytdl.getBasicInfo(videoUrl);
+                videoTitle = info.videoDetails.title;
+                thumbnail = info.videoDetails.thumbnails?.[0]?.url;
+            } else {
+                const searchResults = await yts(query);
+                const videos = searchResults.videos;
+                if (!videos?.length) {
+                    return sock.sendMessage(chatId, { text: '❌ No results found.' }, { quoted: m });
+                }
+                videoUrl = videos[0].url;
+                videoTitle = videos[0].title;
+                thumbnail = videos[0].thumbnail;
+            }
+
+            if (thumbnail) {
+                await sock.sendMessage(chatId, {
+                    image: { url: thumbnail },
+                    caption: `🎶 *${videoTitle}*\n\n⏳ Downloading locally...`
+                }, { quoted: m });
+            }
+
+            const sanitizedTitle = videoTitle.replace(/[\\/:*?"<>|]/g, '');
+            filePath = path.join(__dirname, `../${Date.now()}.mp3`);
+
+            const stream = ytdl(videoUrl);
+            const writeStream = fs.createWriteStream(filePath);
+
+            await new Promise((resolve, reject) => {
+                stream.pipe(writeStream);
+                writeStream.on('finish', resolve);
+                writeStream.on('error', reject);
+            });
+
+            await sock.sendMessage(chatId, {
+                audio: { url: filePath },
+                mimetype: 'audio/mp4',
+                fileName: `${sanitizedTitle}.m4a`,
+                ptt: false
+            }, { quoted: m });
+
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+        } catch (err) {
+            if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            console.error('Local song plugin error:', err.message);
+            await sock.sendMessage(chatId, { text: `❌ Failed: ${err.message}` }, { quoted: m });
+        }
+    }
+};
+
