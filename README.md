@@ -1,7 +1,7 @@
 # 🤖 18k bot | High Performance Multi-Device Bot
 
 <p align="center">
-  <img src="https://catbox.moe" alt="18k bot Asuka" width="450">
+  <img src="https://files.catbox.moe/kdk4hw.jpg" alt="18k bot Asuka" width="450">
   </p>
 
   Benvenuto nella pagina ufficiale di **18k bot**! Un bot multi-dispositivo potente, leggero e veloce. 
