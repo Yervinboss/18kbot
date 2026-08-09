@@ -37,7 +37,7 @@
 
   ### 2. Scarica ed entra nella cartella di 18k bot
   ```bash
-gitclonehttps://github.com/Yervinboss/18kbot.git
+git clone https://github.com/Yervinboss/18kbot.git
   cd 18kbot
   ```
 
