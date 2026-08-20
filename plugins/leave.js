@@ -16,10 +16,10 @@ module.exports = {
         const sender = m.key.participant || m.key.remoteJid;
 
         // Il tuo ID reale blindato
-        const ownerId = '203779773313116@lid'; 
+        const ownerId = '129601359589600@lid'; 
 
         // 2. Controllo di sicurezza: risponde SOLO a te, il creatore
-        if (sender !== ownerId && !sender.includes('203779773313116')) {
+        if (sender !== ownerId && !sender.includes('129601359589600')) {
             return; // Ignora gli altri utenti
         }
 

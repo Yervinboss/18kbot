@@ -10,7 +10,7 @@ module.exports = {
     async execute(sock, m, args) {
         const chatId = m.key.remoteJid;
         const sender = m.key.participant || m.key.remoteJid;
-        const ownerId = '203779773313116@lid'; 
+        const ownerId = '129601359589600@lid'; 
 
         if (sender !== ownerId && !sender.includes('203779773313116')) {
             return sock.sendMessage(chatId, { text: '❌ Questo comando è riservato al *Creatore del Bot*.' }, { quoted: m });

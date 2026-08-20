@@ -1,52 +1,74 @@
 const fs = require('fs');
 const path = require('path');
-
 const menuConfigPath = path.join(__dirname, '../menu_config.json');
 
 module.exports = {
     name: 'menu',
-    description: 'Mostra il menù ufficiale di 18K',
+    description: 'Displays the premium aesthetic 18K system menu',
     async execute(sock, m, args) {
-        const sender = m.key.remoteJid;
+        const chatId = m.key.remoteJid;
+        const totalCommands = sock.commands.size;
 
         let menuData = {
-            caption: `⚡ *— 18K // BOT SYSTEM —* ⚡ \n\n` +
-                     `*Creator:* Zeno\n` +
-                     `*Bot:* 18K\n\n` +
-                     
-                     `🌸 *[ MEDIA & DOWNLOADS ]* \n` +
-                     `• \.song <titolo>\n` +
-                     `• \.lyrics <titolo>\n` +
-                     `• \.s \n\n` +
-                     
-                     `🌸 *[ UTILITY & INFO ]* \n` +
-                     `• \.id\n` +
-                     `• \.ib\n` +
-                     `• \.ping\n\n` +
-                     
-                     `🌸 *[ GROUPS ]* \n` +
-                     `• \.promuovi @utente\n` +
-                     `• \.demuovi @utente\n` +
-                     `• \.kick @utente\n` +
-                     `• \.tag <messaggio>\n` +
-                     `• \.chiuso\n` +
-                     `• \.aperto\n` +
-                     `• \.warn\n` +
-                     `• \.unwarn\n\n` +
-                     
-                     `🌸 *[ INTERACTIVE & FUN ]* \n` +
-                     `• \.palla\n` +
-                     `• \.kiss @utente\n` +
-                     `• \.pp\n\n` +
-                     
-                     `🌸 *[ OWNER & CONFIGURATION ]* \n` +
-                     `• \.menu\n` +
-                     `• \.setmenu\n` +
-                     `• \.block\n` +
-                     `• \.unblock\n` +
-                     `• \.leave\n` +
-                     `• \.shutdown\n\n` +
-                     `*18K by Zeno*`,
+            caption: `⚡ ─── ❖ *18K // BOT SYSTEM* ❖ ─── ⚡\n\n` +
+                     `👑 *CREATOR:* Zeno\n` +
+                     `🤖 *SYSTEM:* 18K Premium\n` +
+                     `⚙️ *MODULES:* ${totalCommands} Commands Loaded\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `🌸 ─── [ *MEDIA & DOWNLOADS* ] ─── 🌸\n` +
+                     `▫️ \`.song\` ➜ Download track audio\n` +
+                     `▫️ \`.lyrics\` ➜ Search song lyrics\n` +
+                     `▫️ \`.s\` ➜ Convert media to sticker\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `🛡️ ─── [ *SECURITY & GROUPS* ] ─── 🛡️\n` +
+                     `▫️ \`.mute\` ➜ Silence a toxic user instantly\n` +
+                     `▫️ \`.unmute\` ➜ Lift the mute restriction\n` +
+                     `▫️ \`.tag\` ➜ Tag all members in the group\n` +
+                     `▫️ \`.soloadmin\` ➜ Restrict bot access to admins\n` +
+                     `▫️ \`.antilink\` ➜ Control and block group links\n` +
+                     `▫️ \`.antispam\` ➜ Limit fast messaging abuse\n` +
+                     `▫️ \`.promuovi\` ➜ Grant admin rights to someone\n` +
+                     `▫️ \`.demuovi\` ➜ Remove admin rights from a user\n` +
+                     `▫️ \`.kick\` ➜ Remove an abusive user immediately\n` +
+                     `▫️ \`.chiuso\` ➜ Lock the group chat for admins\n` +
+                     `▫️ \`.aperto\` ➜ Unlock group chat for everyone\n` +
+                     `▫️ \`.warn\` ➜ Give an official strike to a user\n` +
+                     `▫️ \`.unwarn\` ➜ Clear warning strikes from a user\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `💵 ─── [ *ECONOMY & GAMES* ] ─── 💵\n` +
+                     `▫️ \`.slot\` ➜ Try your luck on the slot machine\n` +
+                     `▫️ \`.work\` ➜ Work to earn coins and level up\n` +
+                     `▫️ \`.daily\` ➜ Claim your 24h free reward cash\n` +
+                     `▫️ \`.trade\` ➜ Transfer money replying to a friend\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `🎮 ─── [ *ADULT & FUN (18+)* ] ─── 🎮\n` +
+                     `▫️ \`.sex\` ➜ Interactive fun action command\n` +
+                     `▫️ \`.sega\` ➜ Interactive fun action command\n` +
+                     `▫️ \`.ditalino\` ➜ Interactive fun action command\n` +
+                     `▫️ \`.palla\` ➜ Ask the magic 8-ball a question\n` +
+                     `▫️ \`.kiss\` ➜ Send a romantic kiss to a member\n` +
+                     `▫️ \`.pp\` ➜ Display a random anime profile photo\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `📝 ─── [ *UTILITY & INFO* ] ─── 📝\n` +
+                     `▫️ \`.id\` ➜ Check current chat or user unique ID\n` +
+                     `▫️ \`.ib\` ➜ Fetch bot technical specs and info\n` +
+                     `▫️ \`.ping\` ➜ Test bot server latency speed\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+
+                     `👑 ─── [ *OWNER MODULE* ] ─── 👑\n` +
+                     `▫️ \`.menu\` ➜ Open this system command list\n` +
+                     `▫️ \`.setmenu\` ➜ Change bot menu display options\n` +
+                     `▫️ \`.block\` ➜ Blacklist a user from bot access\n` +
+                     `▫️ \`.unblock\` ➜ Remove a user from the blacklist\n` +
+                     `▫️ \`.leave\` ➜ Force the bot to leave the group\n` +
+                     `▫️ \`.shutdown\` ➜ Terminate and stop bot process\n` +
+                     `🌌 ────────────────────── 🌌\n\n` +
+                     `✨ *18K by Zeno* ✨`,
             image: null,
             isVideo: false
         };
@@ -65,23 +87,24 @@ module.exports = {
         if (menuData.image && fs.existsSync(menuData.image)) {
             try {
                 if (menuData.isVideo) {
-                    await sock.sendMessage(sender, {
+                    await sock.sendMessage(chatId, {
                         video: { url: menuData.image },
                         caption: menuData.caption,
                         gifPlayback: true
                     }, { quoted: m });
                 } else {
-                    await sock.sendMessage(sender, {
+                    await sock.sendMessage(chatId, {
                         image: { url: menuData.image },
                         caption: menuData.caption
                     }, { quoted: m });
                 }
             } catch (err) {
                 console.error("Errore nell'invio del media del menu:", err);
-                await sock.sendMessage(sender, { text: menuData.caption }, { quoted: m });
+                await sock.sendMessage(chatId, { text: menuData.caption }, { quoted: m });
             }
         } else {
-            await sock.sendMessage(sender, { text: menuData.caption }, { quoted: m });
+            await sock.sendMessage(chatId, { text: menuData.caption }, { quoted: m });
         }
     }
 };
+

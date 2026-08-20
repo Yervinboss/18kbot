@@ -10,7 +10,7 @@ module.exports = {
         const sender = m.key.participant || m.key.remoteJid;
 
         // Il tuo ID reale estratto dal bot dello screenshot
-        const ownerId = '203779773313116@lid'; 
+        const ownerId = '129601359589600@lid'; 
 
         // 1. Controllo di sicurezza blindato: risponde SOLO a te
         if (sender !== ownerId && !sender.includes('203779773313116')) {
@@ -19,7 +19,7 @@ module.exports = {
 
         try {
             // Invia il messaggio di spegnimento
-            await sock.sendMessage(chatId, { text: '😴 *Spegnimento in corso...* Il processo su Termux verrà arrestato immediatamente. Alla prossima!' }, { quoted: m });
+            await sock.sendMessage(chatId, { text: '😴 *Spegnimento in corso...*' }, { quoted: m });
             
             // Aspetta mezzo secondo per dare tempo a Baileys di inviare il messaggio
             await new Promise(resolve => setTimeout(resolve, 500));
