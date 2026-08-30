@@ -1,0 +1,6 @@
+node_modules/
+sessions/
+Database/
+*.mp3
+tmp_*
+*.json
