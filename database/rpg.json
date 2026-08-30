@@ -1,0 +1,309 @@
+{
+  "639753418164": {
+    "level": 168,
+    "xp": 585,
+    "money": 368,
+    "lastWork": 1788019142748,
+    "spouse": "393891467111",
+    "lastRob": 1787912744474
+  },
+  "393513673426": {
+    "level": 1,
+    "xp": 0,
+    "money": 2930,
+    "lastWork": 0
+  },
+  "393891467111": {
+    "level": 1,
+    "xp": 0,
+    "money": 3000000,
+    "spouse": "639753418164"
+  },
+  "393501503188": {
+    "level": 3,
+    "xp": 65,
+    "money": 7048,
+    "lastWork": 1788015274065,
+    "lastRob": 0
+  },
+  "393248634921": {
+    "level": 3,
+    "xp": 146,
+    "money": 7504,
+    "lastWork": 1788044014923,
+    "lastRob": 1788044003075
+  },
+  "393296647272": {
+    "level": 4,
+    "xp": 201,
+    "money": 15053,
+    "lastWork": 1787968062427,
+    "lastRob": 0
+  },
+  "393519983954": {
+    "level": 8,
+    "xp": 660,
+    "money": 62344,
+    "lastWork": 1788043565292,
+    "lastRob": 1787927828245
+  },
+  "393761412246": {
+    "level": 68,
+    "xp": 513,
+    "money": 6436,
+    "lastWork": 1787951896364,
+    "lastRob": 1787928910887
+  },
+  "639751947124": {
+    "level": 1,
+    "xp": 48,
+    "money": 1585,
+    "lastWork": 1787916629033
+  },
+  "393534422710": {
+    "level": 5,
+    "xp": 358,
+    "money": 32611,
+    "lastWork": 1788013044618,
+    "lastRob": 1788042240961
+  },
+  "393534194723": {
+    "level": 1,
+    "xp": 0,
+    "money": 3000,
+    "lastWork": 0
+  },
+  "393884449151": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393518759701": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393518564306": {
+    "level": 2,
+    "xp": 7,
+    "money": 726,
+    "lastWork": 1787928064827
+  },
+  "15876754201": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393292272422": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393791214268": {
+    "level": 6,
+    "xp": 113,
+    "money": 12035,
+    "lastWork": 1788012263343,
+    "lastRob": 1788012285303
+  },
+  "212786640340": {
+    "level": 2,
+    "xp": 14,
+    "money": 5174,
+    "lastWork": 1787936303111
+  },
+  "393515286714": {
+    "level": 5,
+    "xp": 80,
+    "money": 43195,
+    "lastWork": 1787968350386
+  },
+  "639754234855": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393884397829": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393892151021": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "6282321586310": {
+    "level": 3,
+    "xp": 110,
+    "money": 4493,
+    "lastWork": 1787968189805,
+    "lastRob": 1787968369794
+  },
+  "393899938038": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393517588029": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "212688260694": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393518670007": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "6283171922870": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393885718247": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393761647697": {
+    "level": 1,
+    "xp": 0,
+    "money": 5500,
+    "lastWork": 0
+  },
+  "393533835044": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393517736319": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393273624283": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393270177184": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "212783605824": {
+    "level": 1,
+    "xp": 0,
+    "money": 6000,
+    "lastWork": 0
+  },
+  "393458749983": {
+    "level": 4,
+    "xp": 284,
+    "money": 0,
+    "lastWork": 1787968259755,
+    "lastRob": 1787968325785
+  },
+  "393518209808": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "212780089865": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393517360656": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393482934824": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393513442911": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "639516011661": {
+    "level": 1,
+    "xp": 0,
+    "money": 700,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393938973674": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393927508673": {
+    "level": 1,
+    "xp": 0,
+    "money": 1000,
+    "lastWork": 0,
+    "lastRob": 0
+  },
+  "393478623976": {
+    "level": 2,
+    "xp": 37,
+    "money": 676,
+    "lastWork": 1788044423036,
+    "lastRob": 1788044552267
+  }
+}

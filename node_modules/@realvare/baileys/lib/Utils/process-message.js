@@ -1,0 +1,514 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getChatId = exports.shouldIncrementChatUnread = exports.isRealMessage = exports.cleanMessage = void 0;
+exports.decryptPollVote = decryptPollVote;
+const WAProto_1 = require("../../WAProto");
+const Types_1 = require("../Types");
+const messages_1 = require("../Utils/messages");
+const WABinary_1 = require("../WABinary");
+const crypto_1 = require("./crypto");
+const generics_1 = require("./generics");
+const history_1 = require("./history");
+const REAL_MSG_STUB_TYPES = new Set([
+    Types_1.WAMessageStubType.CALL_MISSED_GROUP_VIDEO,
+    Types_1.WAMessageStubType.CALL_MISSED_GROUP_VOICE,
+    Types_1.WAMessageStubType.CALL_MISSED_VIDEO,
+    Types_1.WAMessageStubType.CALL_MISSED_VOICE
+]);
+const REAL_MSG_REQ_ME_STUB_TYPES = new Set([
+    Types_1.WAMessageStubType.GROUP_PARTICIPANT_ADD
+]);
+
+const normalizeToJid = (jid) => {
+    if (!jid || typeof jid !== 'string') {
+        return jid;
+    }
+    if ((0, WABinary_1.isLid)(jid)) {
+        const decoded = (0, WABinary_1.lidToJid)(jid);
+        return decoded || jid;
+    }
+    return jid;
+};
+
+const cleanMessage = (message, meId) => {
+    try {
+        message.key.remoteJid = normalizeToJid(message.key.remoteJid);
+    }
+    catch (_e) {
+    }
+    if (message.key.participant) {
+        try {
+            message.key.participant = normalizeToJid(message.key.participant);
+        }
+        catch (_e) {
+        }
+    }
+    message.key.remoteJidNormalized = message.key.remoteJid;
+    const content = (0, messages_1.normalizeMessageContent)(message.message);
+    if (content === null || content === void 0 ? void 0 : content.reactionMessage) {
+        normaliseKey(content.reactionMessage.key);
+    }
+    if (content === null || content === void 0 ? void 0 : content.pollUpdateMessage) {
+        normaliseKey(content.pollUpdateMessage.pollCreationMessageKey);
+    }
+    function normaliseKey(msgKey) {
+        if (!message.key.fromMe) {
+            msgKey.fromMe = !msgKey.fromMe
+                ? (0, WABinary_1.areJidsSameUser)(msgKey.participant || msgKey.remoteJid, meId)
+                : false;
+            msgKey.remoteJid = message.key.remoteJid;
+            msgKey.participant = msgKey.participant || message.key.participant;
+        }
+    }
+};
+exports.cleanMessage = cleanMessage;
+const isRealMessage = (message, meId) => {
+    var _a;
+    const normalizedContent = (0, messages_1.normalizeMessageContent)(message.message);
+    const hasSomeContent = !!(0, messages_1.getContentType)(normalizedContent);
+    return (!!normalizedContent
+        || REAL_MSG_STUB_TYPES.has(message.messageStubType)
+        || (REAL_MSG_REQ_ME_STUB_TYPES.has(message.messageStubType)
+            && ((_a = message.messageStubParameters) === null || _a === void 0 ? void 0 : _a.some(p => (0, WABinary_1.areJidsSameUser)(meId, p)))))
+        && hasSomeContent
+        && !(normalizedContent === null || normalizedContent === void 0 ? void 0 : normalizedContent.protocolMessage)
+        && !(normalizedContent === null || normalizedContent === void 0 ? void 0 : normalizedContent.reactionMessage)
+        && !(normalizedContent === null || normalizedContent === void 0 ? void 0 : normalizedContent.pollUpdateMessage);
+};
+exports.isRealMessage = isRealMessage;
+const shouldIncrementChatUnread = (message) => (!message.key.fromMe && !message.messageStubType);
+exports.shouldIncrementChatUnread = shouldIncrementChatUnread;
+const getChatId = ({ remoteJid, participant, fromMe }) => {
+    if ((0, WABinary_1.isJidBroadcast)(remoteJid)
+        && !(0, WABinary_1.isJidStatusBroadcast)(remoteJid)
+        && !fromMe) {
+        return participant;
+    }
+    return remoteJid;
+};
+exports.getChatId = getChatId;
+function decryptPollVote({ encPayload, encIv }, { pollCreatorJid, pollMsgId, pollEncKey, voterJid, }) {
+    const sign = Buffer.concat([
+        toBinary(pollMsgId),
+        toBinary(pollCreatorJid),
+        toBinary(voterJid),
+        toBinary('Poll Vote'),
+        new Uint8Array([1])
+    ]);
+    const key0 = (0, crypto_1.hmacSign)(pollEncKey, new Uint8Array(32), 'sha256');
+    const decKey = (0, crypto_1.hmacSign)(sign, key0, 'sha256');
+    const aad = toBinary(`${pollMsgId}\u0000${voterJid}`);
+    const decrypted = (0, crypto_1.aesDecryptGCM)(encPayload, decKey, encIv, aad);
+    return WAProto_1.proto.Message.PollVoteMessage.decode(decrypted);
+    function toBinary(txt) {
+        return Buffer.from(txt);
+    }
+}
+const processMessage = async (message, { shouldProcessHistoryMsg, placeholderResendCache, ev, creds, keyStore, logger, options, getMessage }) => {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s;
+    const meId = creds.me.id;
+    const { accountSettings } = creds;
+    const chat = { id: (0, WABinary_1.jidNormalizedUser)((0, exports.getChatId)(message.key)) };
+    const isRealMsg = (0, exports.isRealMessage)(message, meId);
+    if (isRealMsg) {
+        chat.messages = [{ message }];
+        chat.conversationTimestamp = (0, generics_1.toNumber)(message.messageTimestamp);
+        if ((0, exports.shouldIncrementChatUnread)(message)) {
+            chat.unreadCount = (chat.unreadCount || 0) + 1;
+        }
+    }
+    const content = (0, messages_1.normalizeMessageContent)(message.message);
+    if ((isRealMsg || ((_b = (_a = content === null || content === void 0 ? void 0 : content.reactionMessage) === null || _a === void 0 ? void 0 : _a.key) === null || _b === void 0 ? void 0 : _b.fromMe))
+        && (accountSettings === null || accountSettings === void 0 ? void 0 : accountSettings.unarchiveChats)) {
+        chat.archived = false;
+        chat.readOnly = false;
+    }
+    const protocolMsg = content === null || content === void 0 ? void 0 : content.protocolMessage;
+    if (protocolMsg) {
+        const SELF_ONLY_TYPES = new Set([
+            WAProto_1.proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            WAProto_1.proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE,
+            WAProto_1.proto.Message.ProtocolMessage.Type.LID_MIGRATION_MAPPING_SYNC,
+            WAProto_1.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE
+        ].filter(type => type !== undefined && type !== null));
+        if (protocolMsg.type !== null &&
+            protocolMsg.type !== undefined &&
+            SELF_ONLY_TYPES.has(protocolMsg.type) &&
+            !message.key.fromMe) {
+            logger === null || logger === void 0 ? void 0 : logger.warn({ msgId: message.key.id, type: protocolMsg.type, from: message.key.participant || message.key.remoteJid }, 'dropping spoofed self-only protocolMessage from non-self origin');
+            return;
+        }
+        switch (protocolMsg.type) {
+            case WAProto_1.proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION:
+                const histNotification = protocolMsg.historySyncNotification;
+                const process = shouldProcessHistoryMsg;
+                const isLatest = !((_c = creds.processedHistoryMessages) === null || _c === void 0 ? void 0 : _c.length);
+                logger === null || logger === void 0 ? void 0 : logger.info({
+                    histNotification,
+                    process,
+                    id: message.key.id,
+                    isLatest,
+                }, 'got history notification');
+                if (process) {
+                    if (histNotification.syncType !== WAProto_1.proto.HistorySync.HistorySyncType.ON_DEMAND) {
+                        ev.emit('creds.update', {
+                            processedHistoryMessages: [
+                                ...(creds.processedHistoryMessages || []),
+                                { key: message.key, messageTimestamp: message.messageTimestamp }
+                            ]
+                        });
+                    }
+                    const data = await (0, history_1.downloadAndProcessHistorySyncNotification)(histNotification, options);
+                    ev.emit('messaging-history.set', {
+                        ...data,
+                        isLatest: histNotification.syncType !== WAProto_1.proto.HistorySync.HistorySyncType.ON_DEMAND
+                            ? isLatest
+                            : undefined,
+                        peerDataRequestSessionId: histNotification.peerDataRequestSessionId
+                    });
+                }
+                break;
+            case WAProto_1.proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE:
+                const keys = protocolMsg.appStateSyncKeyShare.keys;
+                if (keys === null || keys === void 0 ? void 0 : keys.length) {
+                    let newAppStateSyncKeyId = '';
+                    await keyStore.transaction(async () => {
+                        const newKeys = [];
+                        for (const { keyData, keyId } of keys) {
+                            const strKeyId = Buffer.from(keyId.keyId).toString('base64');
+                            newKeys.push(strKeyId);
+                            await keyStore.set({ 'app-state-sync-key': { [strKeyId]: keyData } });
+                            newAppStateSyncKeyId = strKeyId;
+                        }
+                        logger === null || logger === void 0 ? void 0 : logger.info({ newAppStateSyncKeyId, newKeys }, 'injecting new app state sync keys');
+                    });
+                    ev.emit('creds.update', { myAppStateKeyId: newAppStateSyncKeyId });
+                }
+                else {
+                    logger === null || logger === void 0 ? void 0 : logger.info({ protocolMsg }, 'recv app state sync with 0 keys');
+                }
+                break;
+            case WAProto_1.proto.Message.ProtocolMessage.Type.REVOKE:
+                ev.emit('messages.update', [
+                    {
+                        key: {
+                            ...message.key,
+                            id: protocolMsg.key.id
+                        },
+                        update: { message: null, messageStubType: Types_1.WAMessageStubType.REVOKE, key: message.key }
+                    }
+                ]);
+                break;
+            case WAProto_1.proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING:
+                Object.assign(chat, {
+                    ephemeralSettingTimestamp: (0, generics_1.toNumber)(message.messageTimestamp),
+                    ephemeralExpiration: protocolMsg.ephemeralExpiration || null
+                });
+                break;
+            case WAProto_1.proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
+                const response = protocolMsg.peerDataOperationRequestResponseMessage;
+                if (response) {
+                    placeholderResendCache === null || placeholderResendCache === void 0 ? void 0 : placeholderResendCache.del(response.stanzaId);
+                    const { peerDataOperationResult } = response;
+                    for (const result of peerDataOperationResult) {
+                        const { placeholderMessageResendResponse: retryResponse } = result;
+                        if (retryResponse) {
+                            const webMessageInfo = WAProto_1.proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes);
+                            setTimeout(() => {
+                                ev.emit('messages.upsert', {
+                                    messages: [webMessageInfo],
+                                    type: 'notify',
+                                    requestId: response.stanzaId
+                                });
+                            }, 500);
+                        }
+
+                        if (result.stickerMessage) {
+                            ev.emit('sticker.upload-result', {
+                                stickerMessage: result.stickerMessage,
+                                requestId: response.stanzaId
+                            });
+                        }
+
+                        if (result.mediaUploadResult !== undefined) {
+                            ev.emit('media.upload-result', {
+                                result: result.mediaUploadResult,
+                                requestId: response.stanzaId
+                            });
+                        }
+
+                        if (result.linkPreviewResponse) {
+                            ev.emit('link-preview.response', {
+                                response: result.linkPreviewResponse,
+                                requestId: response.stanzaId
+                            });
+                        }
+
+                        if (result.historySyncChunkRetryResponse) {
+                            const historySyncResponse = result.historySyncChunkRetryResponse;
+                            ev.emit('history-sync.chunk-retry', {
+                                syncType: historySyncResponse.syncType,
+                                chunkOrder: historySyncResponse.chunkOrder,
+                                requestId: historySyncResponse.requestId,
+                                responseCode: historySyncResponse.responseCode,
+                                canRecover: historySyncResponse.canRecover,
+                                stanzaId: response.stanzaId
+                            });
+                        }
+                        if (result.fullHistorySyncOnDemandRequestResponse) {
+                            ev.emit('history-sync.on-demand-response', {
+                                response: result.fullHistorySyncOnDemandRequestResponse,
+                                requestId: response.stanzaId
+                            });
+                        }
+                    }
+                }
+            case WAProto_1.proto.Message.ProtocolMessage.Type.MESSAGE_EDIT:
+                ev.emit('messages.update', [
+                    {
+                        key: { ...message.key, id: (_d = protocolMsg.key) === null || _d === void 0 ? void 0 : _d.id },
+                        update: {
+                            message: {
+                                editedMessage: {
+                                    message: protocolMsg.editedMessage
+                                }
+                            },
+                            messageTimestamp: protocolMsg.timestampMs
+                                ? Math.floor((0, generics_1.toNumber)(protocolMsg.timestampMs) / 1000)
+                                : message.messageTimestamp
+                        }
+                    }
+                ]);
+                break;
+        }
+    }
+    else if (content === null || content === void 0 ? void 0 : content.reactionMessage) {
+        const reaction = {
+            ...content.reactionMessage,
+            key: message.key,
+        };
+        ev.emit('messages.reaction', [{
+            reaction,
+            key: (_e = content.reactionMessage) === null || _e === void 0 ? void 0 : _e.key,
+        }]);
+    }
+    else if (message.messageStubType) {
+        const jid = (_f = message.key) === null || _f === void 0 ? void 0 : _f.remoteJid;
+        let participants;
+        const author = normalizeToJid(message.participant);
+        const emitParticipantsUpdate = (action) => (ev.emit('group-participants.update', { id: jid, author, participants, action }));
+        const emitGroupUpdate = (update) => {
+            var _a;
+            ev.emit('groups.update', [{ id: jid, ...update, author: (_a = author) !== null && _a !== void 0 ? _a : undefined }]);
+        };
+        const emitGroupRequestJoin = (participant, action, method) => {
+            ev.emit('group.join-request', { id: jid, author, participant: normalizeToJid(participant), action, method: method });
+        };
+        const participantsIncludesMe = () => participants.find(jid => (0, WABinary_1.areJidsSameUser)(meId, jid));
+        switch (message.messageStubType) {
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_CHANGE_NUMBER:
+                participants = (message.messageStubParameters || []).map(normalizeToJid);
+                participants = participants.map(p => {
+                    if (typeof p === 'string') {
+                        const cleanedJid = (0, WABinary_1.validateAndCleanJid)(p);
+                        return cleanedJid;
+                    }
+                    return p;
+                });
+                emitParticipantsUpdate('modify');
+                break;
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_LEAVE:
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_REMOVE:
+                participants = (message.messageStubParameters || []).map(normalizeToJid);
+                participants = participants.map(p => {
+                    if (typeof p === 'string') {
+                        const cleanedJid = (0, WABinary_1.validateAndCleanJid)(p);
+                        return cleanedJid;
+                    }
+                    return p;
+                });
+                emitParticipantsUpdate('remove');
+                if (participantsIncludesMe()) {
+                    chat.readOnly = true;
+                }
+                break;
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_ADD:
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_INVITE:
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_ADD_REQUEST_JOIN:
+                participants = (message.messageStubParameters || []).map(normalizeToJid);
+                participants = participants.map(p => {
+                    if (typeof p === 'string') {
+                        const cleanedJid = (0, WABinary_1.validateAndCleanJid)(p);
+                        return cleanedJid;
+                    }
+                    return p;
+                });
+                if (participantsIncludesMe()) {
+                    chat.readOnly = false;
+                }
+                emitParticipantsUpdate('add');
+                break;
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_DEMOTE:
+                participants = (message.messageStubParameters || []).map(normalizeToJid);
+                participants = participants.map(p => {
+                    if (typeof p === 'string') {
+                        const cleanedJid = (0, WABinary_1.validateAndCleanJid)(p);
+                        return cleanedJid;
+                    }
+                    return p;
+                });
+                emitParticipantsUpdate('demote');
+                break;
+            case Types_1.WAMessageStubType.GROUP_PARTICIPANT_PROMOTE:
+                participants = (message.messageStubParameters || []).map(normalizeToJid);
+                participants = participants.map(p => {
+                    if (typeof p === 'string') {
+                        const cleanedJid = (0, WABinary_1.validateAndCleanJid)(p);
+                        return cleanedJid;
+                    }
+                    return p;
+                });
+                emitParticipantsUpdate('promote');
+                break;
+            case Types_1.WAMessageStubType.GROUP_CHANGE_ANNOUNCE:
+                const announceValue = (_g = message.messageStubParameters) === null || _g === void 0 ? void 0 : _g[0];
+                emitGroupUpdate({ announce: announceValue === 'true' || announceValue === 'on' });
+                break;
+            case Types_1.WAMessageStubType.GROUP_CHANGE_RESTRICT:
+                const restrictValue = (_h = message.messageStubParameters) === null || _h === void 0 ? void 0 : _h[0];
+                emitGroupUpdate({ restrict: restrictValue === 'true' || restrictValue === 'on' });
+                break;
+            case Types_1.WAMessageStubType.GROUP_CHANGE_SUBJECT:
+                const name = (_j = message.messageStubParameters) === null || _j === void 0 ? void 0 : _j[0];
+                chat.name = name;
+                emitGroupUpdate({ subject: name });
+                break;
+            case Types_1.WAMessageStubType.GROUP_CHANGE_DESCRIPTION:
+                const description = (_k = message.messageStubParameters) === null || _k === void 0 ? void 0 : _k[0];
+                chat.description = description;
+                emitGroupUpdate({ desc: description });
+                break;
+            case Types_1.WAMessageStubType.GROUP_CHANGE_INVITE_LINK:
+                const code = (_l = message.messageStubParameters) === null || _l === void 0 ? void 0 : _l[0];
+                emitGroupUpdate({ inviteCode: code });
+                break;
+            case Types_1.WAMessageStubType.GROUP_MEMBER_ADD_MODE:
+                const memberAddValue = (_m = message.messageStubParameters) === null || _m === void 0 ? void 0 : _m[0];
+                emitGroupUpdate({ memberAddMode: memberAddValue === 'all_member_add' });
+                break;
+            case Types_1.WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_MODE:
+                const approvalMode = (_o = message.messageStubParameters) === null || _o === void 0 ? void 0 : _o[0];
+                emitGroupUpdate({ joinApprovalMode: approvalMode === 'on' });
+                break;
+            case Types_1.WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_REQUEST_NON_ADMIN_ADD:
+                const participant = (_p = message.messageStubParameters) === null || _p === void 0 ? void 0 : _p[0];
+                const action = (_q = message.messageStubParameters) === null || _q === void 0 ? void 0 : _q[1];
+                const method = (_r = message.messageStubParameters) === null || _r === void 0 ? void 0 : _r[2];
+                emitGroupRequestJoin(participant, action, method);
+                break;
+        }
+    }
+    else if (content === null || content === void 0 ? void 0 : content.pollUpdateMessage) {
+        const creationMsgKey = content.pollUpdateMessage.pollCreationMessageKey;
+        const pollMsg = await getMessage(creationMsgKey);
+        if (pollMsg) {
+            const pollMsgContent = pollMsg.message || pollMsg;
+            const meIdNormalised = (0, WABinary_1.jidNormalizedUser)(meId);
+
+            const pollCreatorJid = (0, generics_1.getKeyAuthor)(creationMsgKey, meIdNormalised);
+            const voterJid = (0, generics_1.getKeyAuthor)(message.key, meIdNormalised);
+
+            const botLid = creds.me.lid || (creds.me.id ? (0, WABinary_1.jidEncode)((0, WABinary_1.jidDecode)(creds.me.id).user, 'lid') : undefined);
+            if ((0, WABinary_1.areJidsSameUser)(pollCreatorJid, meId) && botLid) {
+                if (!creationMsgKey.participantLid) creationMsgKey.participantLid = botLid;
+            }
+
+            let pollEncKey = (pollMsgContent.messageContextInfo?.messageSecret ||
+                pollMsgContent.pollCreationMessage?.contextInfo?.messageSecret ||
+                pollMsgContent.pollCreationMessageV2?.contextInfo?.messageSecret ||
+                pollMsgContent.pollCreationMessageV3?.contextInfo?.messageSecret);
+
+            try {
+                if (!pollEncKey) throw new Error('No messageSecret found');
+
+                if (pollEncKey && typeof pollEncKey === 'object' && 'data' in pollEncKey) {
+                    pollEncKey = Buffer.from(pollEncKey.data);
+                }
+                if (!(pollEncKey instanceof Uint8Array)) pollEncKey = Buffer.from(pollEncKey);
+
+                const getJidVariants = (msgKey, fallbackJid) => {
+                    const variants = [];
+                    if (fallbackJid) variants.push(fallbackJid);
+                    if (msgKey?.participant) variants.push(msgKey.participant);
+                    if (msgKey?.participantLid) variants.push(msgKey.participantLid);
+
+                    const allCurrent = [...variants];
+                    for (const jid of allCurrent) {
+                        const decoded = (0, WABinary_1.jidDecode)(jid);
+                        if (decoded) {
+                            const user = decoded.user.split(':')[0];
+                            const pn = (0, WABinary_1.jidEncode)(user, 's.whatsapp.net');
+                            variants.push(pn);
+                            variants.push((0, WABinary_1.jidEncode)(user, 'lid'));
+                            const cachedLid = generics_1.LID_CACHE.get(pn);
+                            if (cachedLid) variants.push(cachedLid);
+                        }
+                    }
+                    return [...new Set(variants.filter(Boolean))];
+                };
+
+                const creatorVariants = getJidVariants(pollMsgContent.key || creationMsgKey, pollCreatorJid);
+                const voterVariants = getJidVariants(message.key, voterJid);
+
+                let voteMsg = null;
+                let lastErr = null;
+
+                for (const cJid of creatorVariants) {
+                    for (const vJid of voterVariants) {
+                        try {
+                            const normCJid = (0, WABinary_1.jidNormalizedUser)(cJid);
+                            const normVJid = (0, WABinary_1.jidNormalizedUser)(vJid);
+
+                            voteMsg = decryptPollVote(content.pollUpdateMessage.vote, {
+                                pollEncKey,
+                                pollCreatorJid: normCJid,
+                                pollMsgId: creationMsgKey.id,
+                                voterJid: normVJid,
+                            });
+                            lastErr = null;
+                            break;
+                        } catch (e) { lastErr = e; }
+                    }
+                    if (voteMsg) break;
+                }
+
+                if (!voteMsg && lastErr) throw lastErr;
+
+                ev.emit('messages.update', [
+                    {
+                        key: creationMsgKey,
+                        update: {
+                            pollUpdates: [
+                                {
+                                    pollUpdateMessageKey: message.key,
+                                    vote: voteMsg,
+                                    senderTimestampMs: content.pollUpdateMessage.senderTimestampMs
+                                        ? (content.pollUpdateMessage.senderTimestampMs.toNumber ?
+                                            content.pollUpdateMessage.senderTimestampMs.toNumber() :
+                                            Number(content.pollUpdateMessage.senderTimestampMs))
+                                        : Date.now(),
+                                }
+                            ]
+                        }
+                    }
+                ]);
+            } catch (err) {
+                logger === null || logger === void 0 ? void 0 : logger.warn({ err, creationMsgKey }, 'failed to decrypt poll vote');
+            }
+        }
+    }
+    if (Object.keys(chat).length > 1) {
+        ev.emit('chats.update', [chat]);
+    }
+};
+exports.default = processMessage;

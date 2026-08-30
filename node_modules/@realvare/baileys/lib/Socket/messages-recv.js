@@ -1,0 +1,1791 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.makeMessagesRecvSocket = void 0;
+const boom_1 = require("@hapi/boom");
+const crypto_1 = require("crypto");
+const node_cache_1 = __importDefault(require("@cacheable/node-cache"));
+const WAProto_1 = require("../../WAProto");
+const Defaults_1 = require("../Defaults");
+const Types_1 = require("../Types");
+const Utils_1 = require("../Utils");
+const performance_config_1 = require("../Utils/performance-config");
+const make_mutex_1 = require("../Utils/make-mutex");
+const WABinary_1 = require("../WABinary");
+const groups_1 = require("./groups");
+const messages_send_1 = require("./messages-send");
+const makeMessagesRecvSocket = (config) => {
+    const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid } = config;
+    const sock = (0, messages_send_1.makeMessagesSocket)(config);
+    const { ev, authState, ws, processingMutex, signalRepository, query, upsertMessage, resyncAppState, groupMetadata, onUnexpectedError, assertSessions, sendNode, relayMessage, sendReceipt, uploadPreKeys, createParticipantNodes, getUSyncDevices, sendPeerMessage, sendPeerDataOperationMessage, } = sock;
+    /** this mutex ensures that each retryRequest will wait for the previous one to finish */
+    const retryMutex = (0, make_mutex_1.makeMutex)();
+    let _lastCryptoDesyncUploadMs = 0;
+    const CRYPTO_DESYNC_COOLDOWN_MS = 30 * 1000;
+    const msgRetryCache = config.msgRetryCounterCache || new node_cache_1.default({
+        stdTTL: Defaults_1.DEFAULT_CACHE_TTLS.MSG_RETRY,
+        useClones: false
+    });
+    const callOfferCache = config.callOfferCache || new node_cache_1.default({
+        stdTTL: Defaults_1.DEFAULT_CACHE_TTLS.CALL_OFFER,
+        useClones: false
+    });
+    const placeholderResendCache = config.placeholderResendCache || new node_cache_1.default({
+        stdTTL: Defaults_1.DEFAULT_CACHE_TTLS.MSG_RETRY,
+        useClones: false
+    });
+    const successfulDecryptionCache = new node_cache_1.default({
+        stdTTL: 180,
+        useClones: false,
+        maxKeys: 1000
+    });
+    const notificationDedupCache = new node_cache_1.default({
+        stdTTL: 30,
+        useClones: false,
+        maxKeys: 1000
+    });
+    const notificationStubDedupCache = new node_cache_1.default({
+        stdTTL: 10,
+        useClones: false,
+        maxKeys: 500
+    });
+    const messageStubDedupCache = new node_cache_1.default({
+        stdTTL: 10,
+        useClones: false,
+        maxKeys: 500
+    });
+    // Per-message-ID retry flood detection: prevents retry storms from
+    // saturating the processingMutex when hundreds of group participants
+    // all request retries for the same message
+    const retryFloodCache = new node_cache_1.default({
+        stdTTL: 300,
+        useClones: false,
+        maxKeys: 500
+    });
+    const RETRY_FLOOD_THRESHOLD = 15;
+    const participantRetryCooldown = new Map();
+    const PARTICIPANT_RETRY_MAX = 5;
+    const PARTICIPANT_RETRY_WINDOW_MS = 60 * 1000;
+    const isParticipantRetryCoolingDown = (participant) => {
+        const entry = participantRetryCooldown.get(participant);
+        if (!entry) return false;
+        if (Date.now() - entry.firstRetryAt > PARTICIPANT_RETRY_WINDOW_MS) {
+            participantRetryCooldown.delete(participant);
+            return false;
+        }
+        return entry.count >= PARTICIPANT_RETRY_MAX;
+    };
+    const trackParticipantRetry = (participant) => {
+        const entry = participantRetryCooldown.get(participant);
+        const now = Date.now();
+        if (!entry || now - entry.firstRetryAt > PARTICIPANT_RETRY_WINDOW_MS) {
+            participantRetryCooldown.set(participant, { count: 1, firstRetryAt: now });
+        } else {
+            entry.count++;
+        }
+        // Prevent memory leak: purge expired entries when map grows too large
+        if (participantRetryCooldown.size > 500) {
+            for (const [key, e] of participantRetryCooldown) {
+                if (now - e.firstRetryAt > PARTICIPANT_RETRY_WINDOW_MS) {
+                    participantRetryCooldown.delete(key);
+                }
+            }
+        }
+    };
+    const incomingMsgDedupCache = new node_cache_1.default({
+        stdTTL: 15,
+        useClones: false,
+        maxKeys: 2000
+    });
+    const normalizeStubParam = (param) => {
+        if (param === null || param === undefined) {
+            return '';
+        }
+        if (typeof param === 'string') {
+            const trimmed = param.trim();
+            try {
+                return (0, WABinary_1.validateAndCleanJid)(resolveJid(trimmed));
+            }
+            catch (_err) {
+                return trimmed;
+            }
+        }
+        if (typeof param === 'number' || typeof param === 'boolean') {
+            return String(param);
+        }
+        try {
+            return JSON.stringify(param);
+        }
+        catch (_err) {
+            return String(param);
+        }
+    };
+    const sentMessageCache = new Map();
+    const sentMessageCacheMaxSize = 128;
+    const getSentMessageCacheKey = (remoteJid, id) => `${remoteJid}:${id}`;
+    const getCachedSentMessage = (remoteJid, id) => {
+        const cacheKey = getSentMessageCacheKey(remoteJid, id);
+        const existing = sentMessageCache.get(cacheKey);
+        if (!existing) {
+            return undefined;
+        }
+        sentMessageCache.delete(cacheKey);
+        sentMessageCache.set(cacheKey, existing);
+        return existing;
+    };
+    const cacheSentMessage = (remoteJid, id, message) => {
+        const cacheKey = getSentMessageCacheKey(remoteJid, id);
+        if (sentMessageCache.has(cacheKey)) {
+            sentMessageCache.delete(cacheKey);
+        }
+        sentMessageCache.set(cacheKey, message);
+        while (sentMessageCache.size > sentMessageCacheMaxSize) {
+            const firstKey = sentMessageCache.keys().next().value;
+            sentMessageCache.delete(firstKey);
+        }
+    };
+
+
+    const enqueueReceipt = (jid, participant, msgId, type) => {
+        sendReceipt(jid, participant, [msgId], type)
+            .catch(err => logger.error({ err, key: jid }, 'failed to send receipt'));
+    };
+
+    let sendActiveReceipts = false;
+    const resolveJid = WABinary_1.resolveJid;
+    const sendMessageAck = async ({ tag, attrs, content }, errorCode) => {
+        const stanza = {
+            tag: 'ack',
+            attrs: {
+                id: attrs.id,
+                to: attrs.from,
+                class: tag
+            }
+        };
+        if (!!errorCode) {
+            stanza.attrs.error = errorCode.toString();
+        }
+        if (!!attrs.participant) {
+            stanza.attrs.participant = attrs.participant;
+        }
+        if (!!attrs.recipient) {
+            stanza.attrs.recipient = attrs.recipient;
+        }
+        if (!!attrs.type && (tag !== 'message' || (0, WABinary_1.getBinaryNodeChild)({ tag, attrs, content }, 'unavailable') || errorCode !== 0)) {
+            stanza.attrs.type = attrs.type;
+        }
+        if (tag === 'message' && (0, WABinary_1.getBinaryNodeChild)({ tag, attrs, content }, 'unavailable')) {
+            stanza.attrs.from = authState.creds.me.id;
+        }
+        logger.debug({ recv: { tag, attrs }, sent: stanza.attrs }, 'sent ack');
+        await sendNode(stanza);
+    };
+    // Add withAck wrapper for guaranteed acknowledgments so less ban tag ig (its workin btw LOL)
+    const withAck = (processFn) => async (node) => {
+        try {
+            await processFn(node);
+        } finally {
+            sendMessageAck(node).catch(err => {
+                if (err?.output?.statusCode === 408) {
+                    logger.debug({ id: node?.attrs?.id }, 'ack timed out (408), connection may be slow');
+                } else {
+                    logger.warn({ err, id: node?.attrs?.id }, 'failed to send ack in withAck');
+                }
+            });
+        }
+    };
+    const offerCall = async (toJid, isVideo = false) => {
+        toJid = resolveJid(toJid);
+        const callId = (0, crypto_1.randomBytes)(16).toString('hex').toUpperCase().substring(0, 64);
+        const offerContent = [];
+        offerContent.push({ tag: 'audio', attrs: { enc: 'opus', rate: '16000' }, content: undefined });
+        offerContent.push({ tag: 'audio', attrs: { enc: 'opus', rate: '8000' }, content: undefined });
+        if (isVideo) {
+            offerContent.push({
+                tag: 'video',
+                attrs: {
+                    orientation: '0',
+                    'screen_width': '1920',
+                    'screen_height': '1080',
+                    'device_orientation': '0',
+                    enc: 'vp8',
+                    dec: 'vp8',
+                }
+            });
+        }
+        offerContent.push({ tag: 'net', attrs: { medium: '3' }, content: undefined });
+        offerContent.push({ tag: 'capability', attrs: { ver: '1' }, content: new Uint8Array([1, 4, 255, 131, 207, 4]) });
+        offerContent.push({ tag: 'encopt', attrs: { keygen: '2' }, content: undefined });
+        const encKey = (0, crypto_1.randomBytes)(32);
+        const devices = (await getUSyncDevices([toJid], true, false)).map(({ user, device }) => (0, WABinary_1.jidEncode)(user, 's.whatsapp.net', device));
+        await assertSessions(devices, true);
+        const { nodes: destinations, shouldIncludeDeviceIdentity } = await createParticipantNodes(devices, {
+            call: {
+                callKey: encKey
+            }
+        });
+        offerContent.push({ tag: 'destination', attrs: {}, content: destinations });
+        if (shouldIncludeDeviceIdentity) {
+            offerContent.push({
+                tag: 'device-identity',
+                attrs: {},
+                content: (0, Utils_1.encodeSignedDeviceIdentity)(authState.creds.account, true)
+            });
+        }
+        const stanza = ({
+            tag: 'call',
+            attrs: {
+                to: toJid,
+            },
+            content: [{
+                tag: 'offer',
+                attrs: {
+                    'call-id': callId,
+                    'call-creator': authState.creds.me.id,
+                },
+                content: offerContent,
+            }],
+        });
+        await query(stanza);
+        return {
+            callId,
+            toJid,
+            isVideo,
+        };
+    };
+    const rejectCall = async (callId, callFrom) => {
+        callFrom = resolveJid(callFrom);
+        const stanza = ({
+            tag: 'call',
+            attrs: {
+                from: authState.creds.me.id,
+                to: callFrom,
+            },
+            content: [{
+                tag: 'reject',
+                attrs: {
+                    'call-id': callId,
+                    'call-creator': callFrom,
+                    count: '0',
+                },
+                content: undefined,
+            }],
+        });
+        await query(stanza);
+    };
+    const sendRetryRequest = async (node, forceIncludeKeys = false) => {
+        if (successfulDecryptionCache.get(node.attrs.id)) {
+            logger.debug({ id: node.attrs.id }, 'sendRetryRequest: message was successfully decrypted, skipping retry request');
+            return;
+        }
+        const { fullMessage } = (0, Utils_1.decodeMessageNode)(node, authState.creds.me.id, authState.creds.me.lid || '');
+        const { key: msgKey } = fullMessage;
+        const msgId = msgKey.id;
+        const key = `${msgId}:${msgKey === null || msgKey === void 0 ? void 0 : msgKey.participant}`;
+        let retryCount = msgRetryCache.get(key) || 0;
+        if (retryCount >= maxMsgRetryCount) {
+            logger.debug({ retryCount, msgId }, 'reached retry limit, clearing');
+            msgRetryCache.del(key);
+            return;
+        }
+        retryCount += 1;
+        msgRetryCache.set(key, retryCount);
+        const { account, signedPreKey, signedIdentityKey: identityKey } = authState.creds;
+        if (retryCount === 1) {
+            const msgId = await requestPlaceholderResend(msgKey);
+            logger.debug(`sendRetryRequest: requested placeholder resend for message ${msgId}`);
+        }
+        const deviceIdentity = (0, Utils_1.encodeSignedDeviceIdentity)(account, true);
+        await authState.keys.transaction(async () => {
+            const receipt = {
+                tag: 'receipt',
+                attrs: {
+                    id: msgId,
+                    type: 'retry',
+                    to: node.attrs.from
+                },
+                content: [
+                    {
+                        tag: 'retry',
+                        attrs: {
+                            count: retryCount.toString(),
+                            id: node.attrs.id,
+                            t: node.attrs.t,
+                            v: '1'
+                        }
+                    },
+                    {
+                        tag: 'registration',
+                        attrs: {},
+                        content: (0, Utils_1.encodeBigEndian)(authState.creds.registrationId)
+                    }
+                ]
+            };
+            if (node.attrs.recipient) {
+                receipt.attrs.recipient = node.attrs.recipient;
+            }
+            if (node.attrs.participant) {
+                receipt.attrs.participant = node.attrs.participant;
+            }
+            if (retryCount > 1 || forceIncludeKeys) {
+                const { update, preKeys } = await (0, Utils_1.getNextPreKeys)(authState, 1);
+                const [keyId] = Object.keys(preKeys);
+                const key = preKeys[+keyId];
+                const content = receipt.content;
+                content.push({
+                    tag: 'keys',
+                    attrs: {},
+                    content: [
+                        { tag: 'type', attrs: {}, content: Buffer.from(Defaults_1.KEY_BUNDLE_TYPE) },
+                        { tag: 'identity', attrs: {}, content: identityKey.public },
+                        (0, Utils_1.xmppPreKey)(key, +keyId),
+                        (0, Utils_1.xmppSignedPreKey)(signedPreKey),
+                        { tag: 'device-identity', attrs: {}, content: deviceIdentity }
+                    ]
+                });
+                ev.emit('creds.update', update);
+            }
+            await sendNode(receipt);
+            logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt');
+        });
+    };
+    const handleEncryptNotification = async (node) => {
+        const from = node.attrs.from;
+        if (from === WABinary_1.S_WHATSAPP_NET) {
+            const countChild = (0, WABinary_1.getBinaryNodeChild)(node, 'count');
+            const count = +countChild.attrs.value;
+
+            const shouldUploadMorePreKeys = count < Defaults_1.MIN_PREKEY_COUNT;
+            logger.debug({ count, shouldUploadMorePreKeys }, 'recv pre-key count');
+            if (shouldUploadMorePreKeys) {
+                await uploadPreKeys();
+            }
+        }
+        else {
+            const identityNode = (0, WABinary_1.getBinaryNodeChild)(node, 'identity');
+            if (identityNode) {
+                logger.info({ jid: from }, 'identity changed');
+            }
+        }
+    };
+
+    const toLidIfNecessary = (jid) => {
+        if (typeof jid !== 'string') {
+            return jid;
+        }
+        if (!jid.includes('@') && /^[0-9]+$/.test(jid)) {
+            return `${jid}@s.whatsapp.net`;
+        }
+        if ((0, WABinary_1.isLid)(jid)) {
+            const cached = config.lidCache?.get(jid);
+            if (cached && typeof cached === 'string') {
+                return cached.includes('@') ? cached : `${cached}@s.whatsapp.net`;
+            }
+        }
+        return jid;
+    };
+
+    const resolveLidFromGroupContext = async (lid, groupJid) => {
+        if (!(0, WABinary_1.isLid)(lid) || !(0, WABinary_1.isJidGroup)(groupJid)) {
+            return lid;
+        }
+        const sharedCached = WABinary_1.sharedLidPhoneCache.get(lid);
+        if (sharedCached && typeof sharedCached === 'string') {
+            return sharedCached;
+        }
+        const cached = config.lidCache?.get(lid);
+        if (cached && typeof cached === 'string') {
+            return cached.includes('@') ? cached : `${cached}@s.whatsapp.net`;
+        }
+        try {
+            const metadata = await groupMetadata(groupJid);
+            const found = metadata.participants.find(p => p.id === lid);
+            const jid = found?.jid;
+            if (jid) {
+                if (!(0, WABinary_1.isLid)(jid)) {
+                    config.lidCache?.set?.(lid, jid);
+                    WABinary_1.sharedLidPhoneCache.set(lid, jid);
+                }
+                return jid;
+            }
+        }
+        catch (_err) {
+        }
+        return lid;
+    };
+
+    const resolveLidOrMaskedJidFromGroupContext = async (jid, groupJid) => { // sarà utile one day penso
+        if (typeof jid !== 'string') {
+            return jid;
+        }
+        if ((0, WABinary_1.isLid)(jid)) {
+            return await resolveLidFromGroupContext(jid, groupJid);
+        }
+        const decoded = (0, WABinary_1.jidDecode)(jid);
+        const user = decoded === null || decoded === void 0 ? void 0 : decoded.user;
+        const server = decoded === null || decoded === void 0 ? void 0 : decoded.server;
+        if (server === 's.whatsapp.net' && user && /^[0-9]+$/.test(user)) {
+            const asLid = `${user}@lid`;
+            const resolved = await resolveLidFromGroupContext(asLid, groupJid);
+            return resolved === asLid ? jid : resolved;
+        }
+        return jid;
+    };
+
+    const pnToJid = (pn) => {
+        if (typeof pn !== 'string' || !pn) {
+            return undefined;
+        }
+        return pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
+    };
+
+    const collectContextInfos = (obj, acc) => {
+        if (!obj || typeof obj !== 'object' || obj === null) {
+            return;
+        }
+        if (obj instanceof Uint8Array || Buffer.isBuffer(obj)) {
+            return;
+        }
+        if (Array.isArray(obj)) {
+            for (const item of obj) {
+                collectContextInfos(item, acc);
+            }
+            return;
+        }
+        for (const [key, value] of Object.entries(obj)) {
+            if (key === 'contextInfo' && value && typeof value === 'object') {
+                acc.push(value);
+            }
+            collectContextInfos(value, acc);
+        }
+    };
+
+    const replaceLidInText = (obj, lidUser, phoneUser) => {
+        if (!obj || typeof obj !== 'object' || obj === null) {
+            return;
+        }
+        for (const key in obj) {
+            const val = obj[key];
+            if (typeof val === 'string' && val.includes(`@${lidUser}`)) {
+                obj[key] = val.replace(new RegExp(`@${lidUser}`, 'g'), `@${phoneUser}`);
+            }
+            else if (typeof val === 'object' && val !== null) {
+                replaceLidInText(val, lidUser, phoneUser);
+            }
+        }
+    };
+
+    const normalizeContextInfoJids = async (contextInfo, groupJid, rootMessage) => {
+        if (!contextInfo || typeof contextInfo !== 'object') {
+            return;
+        }
+        const contextJidResolutionCache = new Map();
+        const normalizeJid = async (jid) => {
+            if (typeof jid !== 'string') {
+                return jid;
+            }
+            if (contextJidResolutionCache.has(jid)) {
+                return contextJidResolutionCache.get(jid);
+            }
+            if ((0, WABinary_1.isLid)(jid)) {
+                const myLid = authState === null || authState === void 0 ? void 0 : authState.creds.me.lid;
+                if (typeof myLid === 'string' && myLid) {
+                    const myLidUser = myLid.split(':')[0];
+                    if (myLidUser && jid === `${myLidUser}@lid`) {
+                        const myNormalizedJid = (0, WABinary_1.jidNormalizedUser)(authState.creds.me.id);
+                        if (rootMessage) {
+                            const phoneUser = (0, WABinary_1.jidDecode)(myNormalizedJid).user;
+                            replaceLidInText(rootMessage, myLidUser, phoneUser);
+                        }
+                        contextJidResolutionCache.set(jid, myNormalizedJid);
+                        return myNormalizedJid;
+                    }
+                }
+                let normalized = jid;
+                if (groupJid) {
+                    const fromGroup = await resolveLidFromGroupContext(jid, groupJid);
+                    if (typeof fromGroup === 'string' && !(0, WABinary_1.isLid)(fromGroup)) {
+                        normalized = fromGroup;
+                    }
+                }
+                if (normalized === jid) {
+                    const sharedCached = WABinary_1.sharedLidPhoneCache.get(jid);
+                    if (sharedCached && typeof sharedCached === 'string') {
+                        normalized = sharedCached;
+                    }
+                }
+                if (normalized === jid) {
+                    const cached = config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.get(jid);
+                    if (cached && typeof cached === 'string') {
+                        normalized = cached.includes('@') ? cached : `${cached}@s.whatsapp.net`;
+                    }
+                }
+                if (normalized === jid) {
+                    try {
+                        const fromRepo = (signalRepository === null || signalRepository === void 0 ? void 0 : signalRepository.lidMapping) ? await signalRepository.lidMapping.get(jid) : undefined;
+                        if (typeof fromRepo === 'string' && fromRepo) {
+                            const pnAsJid = fromRepo.includes('@') ? fromRepo : `${fromRepo}@s.whatsapp.net`;
+                            if (config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.set) {
+                                config.lidCache.set(jid, pnAsJid);
+                            }
+                            WABinary_1.sharedLidPhoneCache.set(jid, pnAsJid);
+                            normalized = pnAsJid;
+                        }
+                    }
+                    catch (_err) {
+                    }
+                }
+                if (normalized === jid) {
+                    normalized = (0, WABinary_1.lidToJid)(jid);
+                }
+                if (normalized === jid && (0, WABinary_1.isLid)(jid) && typeof sock.lazyResolveLid === 'function') {
+                    try {
+                        await sock.lazyResolveLid(jid);
+                        normalized = (0, WABinary_1.lidToJid)(jid);
+                    } catch { }
+                }
+                if (rootMessage && normalized !== jid && (0, WABinary_1.isLid)(jid) && !(0, WABinary_1.isLid)(normalized)) {
+                    const lidUser = (0, WABinary_1.jidDecode)(jid).user;
+                    const phoneUser = (0, WABinary_1.jidDecode)(normalized).user;
+                    if (lidUser && phoneUser) {
+                        replaceLidInText(rootMessage, lidUser, phoneUser);
+                    }
+                }
+                contextJidResolutionCache.set(jid, normalized);
+                return normalized;
+            }
+            return jid;
+        };
+        if (typeof contextInfo.participant === 'string') {
+            contextInfo.participant = await normalizeJid(contextInfo.participant);
+        }
+        if (Array.isArray(contextInfo.mentionedJid)) {
+            contextInfo.mentionedJid = await Promise.all(contextInfo.mentionedJid.map(j => normalizeJid(j)));
+        }
+    };
+
+    const handleGroupNotification = async (participant, participantPn, child, groupJid, msg) => {
+        var _a, _b, _c, _d;
+        const childTag = child === null || child === void 0 ? void 0 : child.tag;
+        if (participantPn && participant && (0, WABinary_1.isLid)(participant) && (config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.set)) {
+            const pnAsJid = typeof participantPn === 'string' ? (participantPn.includes('@') ? participantPn : `${participantPn}@s.whatsapp.net`) : participantPn;
+            config.lidCache.set(participant, pnAsJid);
+            WABinary_1.sharedLidPhoneCache.set(participant, pnAsJid);
+        }
+        const participantJid = (((_b = (_a = (0, WABinary_1.getBinaryNodeChild)(child, 'participant')) === null || _a === void 0 ? void 0 : _a.attrs) === null || _b === void 0 ? void 0 : _b.jid) || participant);
+        if (participantPn && participantJid && (0, WABinary_1.isLid)(participantJid) && (config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.set) &&
+            (childTag === 'created_membership_requests' || childTag === 'revoked_membership_requests')) {
+            const pnAsJid = typeof participantPn === 'string' ? (participantPn.includes('@') ? participantPn : `${participantPn}@s.whatsapp.net`) : participantPn;
+            config.lidCache.set(participantJid, pnAsJid);
+            WABinary_1.sharedLidPhoneCache.set(participantJid, pnAsJid);
+        }
+        switch (child === null || child === void 0 ? void 0 : child.tag) {
+            case 'create':
+                let metadata = (0, groups_1.extractGroupMetadata)(child);
+                const fullMetadata = await groupMetadata(groupJid);
+                if (metadata.owner && metadata.owner.endsWith('@lid')) {
+                    const found = fullMetadata.participants.find(p => p.id === metadata.owner);
+                    metadata.owner = (found === null || found === void 0 ? void 0 : found.jid) || (0, WABinary_1.lidToJid)(metadata.owner);
+                }
+                let resolvedAuthor = participant;
+                if (participant.endsWith('@lid')) {
+                    const found = fullMetadata.participants.find(p => p.id === participant);
+                    resolvedAuthor = (found === null || found === void 0 ? void 0 : found.jid) || (0, WABinary_1.lidToJid)(participant);
+                }
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CREATE;
+                msg.messageStubParameters = [metadata.subject];
+                msg.key = { participant: metadata.owner };
+                ev.emit('chats.upsert', [{
+                    id: metadata.id,
+                    name: metadata.subject,
+                    conversationTimestamp: metadata.creation,
+                }]);
+                ev.emit('groups.upsert', [{
+                    ...metadata,
+                    author: resolvedAuthor
+                }]);
+                break;
+            case 'ephemeral':
+            case 'not_ephemeral':
+                msg.message = {
+                    protocolMessage: {
+                        type: WAProto_1.proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
+                        ephemeralExpiration: +(child.attrs.expiration || 0)
+                    }
+                };
+                break;
+            case 'modify':
+                const modifyNodes = (0, WABinary_1.getBinaryNodeChildren)(child, 'participant');
+                const oldNumber = modifyNodes.map(p => {
+                    const phoneNumber = p.attrs.phone_number;
+                    const pn = p.attrs.participant_pn;
+                    if (phoneNumber) {
+                        return typeof phoneNumber === 'string' ? (phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`) : phoneNumber;
+                    }
+                    if (pn) {
+                        return typeof pn === 'string' ? (pn.includes('@') ? pn : `${pn}@s.whatsapp.net`) : pn;
+                    }
+                    return p.attrs.jid;
+                });
+                msg.messageStubParameters = oldNumber || [];
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_PARTICIPANT_CHANGE_NUMBER;
+                break;
+            case 'promote':
+            case 'demote':
+            case 'remove':
+            case 'add':
+            case 'leave':
+                const stubType = `GROUP_PARTICIPANT_${child.tag.toUpperCase()}`;
+                msg.messageStubType = Types_1.WAMessageStubType[stubType];
+                const participantNodes = (0, WABinary_1.getBinaryNodeChildren)(child, 'participant');
+                const participants = await Promise.all(participantNodes.map(async (p) => {
+                    const jid = p.attrs.jid;
+                    const pn = p.attrs.participant_pn;
+                    const phoneNumber = p.attrs.phone_number;
+                    const realPhone = phoneNumber || pn;
+                    if (realPhone && jid && (0, WABinary_1.isLid)(jid) && (config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.set)) {
+                        const pnAsJid = typeof realPhone === 'string' ? (realPhone.includes('@') ? realPhone : `${realPhone}@s.whatsapp.net`) : realPhone;
+                        config.lidCache.set(jid, pnAsJid);
+                        WABinary_1.sharedLidPhoneCache.set(jid, pnAsJid);
+                    }
+                    if (phoneNumber) {
+                        return typeof phoneNumber === 'string' ? (phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`) : phoneNumber;
+                    }
+                    if (pn) {
+                        return typeof pn === 'string' ? (pn.includes('@') ? pn : `${pn}@s.whatsapp.net`) : pn;
+                    }
+                    if ((0, WABinary_1.isLid)(jid) && (config.lidCache === null || config.lidCache === void 0 ? void 0 : config.lidCache.get)) {
+                        const cached = config.lidCache.get(jid);
+                        if (cached && typeof cached === 'string') {
+                            return cached.includes('@') ? cached : `${cached}@s.whatsapp.net`;
+                        }
+                    }
+                    return jid;
+                }));
+                if (participants.length === 1 && (0, WABinary_1.areJidsSameUser)(participants[0], participant) && child.tag === 'remove') {
+                    msg.messageStubType = Types_1.WAMessageStubType.GROUP_PARTICIPANT_LEAVE;
+                }
+                if ((child.tag === 'leave' || msg.messageStubType === Types_1.WAMessageStubType.GROUP_PARTICIPANT_LEAVE) && participants.length === 1 && participantPn && typeof participantPn === 'string') {
+                    msg.messageStubParameters = [toLidIfNecessary(participantPn)];
+                    if (participant && (0, WABinary_1.isLid)(participant)) {
+                        participant = toLidIfNecessary(participantPn);
+                    }
+                }
+                else {
+                    msg.messageStubParameters = participants;
+                }
+                break;
+            case 'subject':
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_SUBJECT;
+                msg.messageStubParameters = [child.attrs.subject];
+                break;
+            case 'description':
+                const description = (_d = (_c = (0, WABinary_1.getBinaryNodeChild)(child, 'body')) === null || _c === void 0 ? void 0 : _c.content) === null || _d === void 0 ? void 0 : _d.toString();
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_DESCRIPTION;
+                msg.messageStubParameters = description ? [description] : undefined;
+                break;
+            case 'announcement':
+            case 'not_announcement':
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_ANNOUNCE;
+                msg.messageStubParameters = [(child.tag === 'announcement') ? 'on' : 'off'];
+                break;
+            case 'locked':
+            case 'unlocked':
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_RESTRICT;
+                msg.messageStubParameters = [(child.tag === 'locked') ? 'on' : 'off'];
+                break;
+            case 'invite':
+                msg.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_INVITE_LINK;
+                msg.messageStubParameters = [child.attrs.code];
+                break;
+            case 'member_add_mode':
+                const addMode = child.content;
+                if (addMode) {
+                    msg.messageStubType = Types_1.WAMessageStubType.GROUP_MEMBER_ADD_MODE;
+                    msg.messageStubParameters = [addMode.toString()];
+                }
+                break;
+            case 'membership_approval_mode':
+                const approvalMode = (0, WABinary_1.getBinaryNodeChild)(child, 'group_join');
+                if (approvalMode) {
+                    msg.messageStubType = Types_1.WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_MODE;
+                    msg.messageStubParameters = [approvalMode.attrs.state];
+                }
+                break;
+            default:
+        }
+    };
+
+    const handleNewsletterNotification = (id, node) => {
+        const messages = (0, WABinary_1.getBinaryNodeChild)(node, 'messages');
+        const message = (0, WABinary_1.getBinaryNodeChild)(messages, 'message');
+        const serverId = message.attrs.server_id;
+        const reactionsList = (0, WABinary_1.getBinaryNodeChild)(message, 'reactions');
+        const viewsList = (0, WABinary_1.getBinaryNodeChildren)(message, 'views_count');
+        if (reactionsList) {
+            const reactions = (0, WABinary_1.getBinaryNodeChildren)(reactionsList, 'reaction');
+            if (reactions.length === 0) {
+                ev.emit('newsletter.reaction', { id, 'server_id': serverId, reaction: { removed: true } });
+            }
+            reactions.forEach(item => {
+                var _a, _b;
+                ev.emit('newsletter.reaction', { id, 'server_id': serverId, reaction: { code: (_a = item.attrs) === null || _a === void 0 ? void 0 : _a.code, count: +((_b = item.attrs) === null || _b === void 0 ? void 0 : _b.count) } });
+            });
+        }
+        if (viewsList.length) {
+            viewsList.forEach(item => {
+                ev.emit('newsletter.view', { id, 'server_id': serverId, count: +item.attrs.count });
+            });
+        }
+    };
+
+    const handleMexNewsletterNotification = (id, node) => {
+        var _a;
+        const operation = node === null || node === void 0 ? void 0 : node.attrs.op_name;
+        const content = JSON.parse((_a = node === null || node === void 0 ? void 0 : node.content) === null || _a === void 0 ? void 0 : _a.toString());
+        let contentPath;
+        if (operation === Types_1.MexOperations.PROMOTE || operation === Types_1.MexOperations.DEMOTE) {
+            let action;
+            if (operation === Types_1.MexOperations.PROMOTE) {
+                action = 'promote';
+                contentPath = content.data[Types_1.XWAPaths.PROMOTE];
+            }
+            if (operation === Types_1.MexOperations.DEMOTE) {
+                action = 'demote';
+                contentPath = content.data[Types_1.XWAPaths.DEMOTE];
+            }
+            const author = resolveJid(contentPath.actor.pn);
+            const user = resolveJid(contentPath.user.pn);
+            ev.emit('newsletter-participants.update', { id, author, user, new_role: contentPath.user_new_role, action });
+        }
+        if (operation === Types_1.MexOperations.UPDATE) {
+            contentPath = content.data[Types_1.XWAPaths.METADATA_UPDATE];
+            ev.emit('newsletter-settings.update', { id, update: contentPath.thread_metadata.settings });
+        }
+    };
+
+    const processNotification = async (node) => {
+        var _a;
+        const result = {};
+        const [child] = (0, WABinary_1.getAllBinaryNodeChildren)(node);
+        const nodeType = node.attrs.type;
+        const from = resolveJid((0, WABinary_1.jidNormalizedUser)(node.attrs.from));
+        switch (nodeType) {
+            case 'privacy_token':
+                const tokenList = (0, WABinary_1.getBinaryNodeChildren)(child, 'token');
+                for (const { attrs, content } of tokenList) {
+                    const jid = resolveJid(attrs.jid);
+                    ev.emit('chats.update', [
+                        {
+                            id: jid,
+                            tcToken: content
+                        }
+                    ]);
+                    logger.debug({ jid }, 'got privacy token update');
+                }
+                break;
+            case 'newsletter':
+                handleNewsletterNotification(node.attrs.from, child);
+                break;
+            case 'mex':
+                handleMexNewsletterNotification(node.attrs.from, child);
+                break;
+            case 'w:gp2':
+                await handleGroupNotification(node.attrs.participant, node.attrs.participant_pn, child, from, result);
+                break;
+            case 'mediaretry':
+                const event = (0, Utils_1.decodeMediaRetryNode)(node);
+                ev.emit('messages.media-update', [event]);
+                break;
+            case 'encrypt':
+                await handleEncryptNotification(node);
+                break;
+            case 'devices':
+                const devices = (0, WABinary_1.getBinaryNodeChildren)(child, 'device');
+                if ((0, WABinary_1.areJidsSameUser)(child.attrs.jid, authState.creds.me.id)) {
+                    const deviceJids = devices.map(d => resolveJid(d.attrs.jid));
+                    logger.info({ deviceJids }, 'got my own devices');
+                    console.log('\x1b[36m%s\x1b[0m', `[WA Web Connect] Rilevato collegamento/cambiamento dispositivi associati: ${deviceJids.join(', ')}`);
+                    try {
+                        logger.info({ rawNode: (0, WABinary_1.binaryNodeToString)(node) }, 'dettagli XML connessione WA Web');
+                    } catch (e) {}
+                }
+                break;
+            case 'server_sync':
+                const update = (0, WABinary_1.getBinaryNodeChild)(node, 'collection');
+                if (update) {
+                    const name = update.attrs.name;
+                    await resyncAppState([name], false);
+                }
+                break;
+            case 'picture':
+                const setPicture = (0, WABinary_1.getBinaryNodeChild)(node, 'set');
+                const delPicture = (0, WABinary_1.getBinaryNodeChild)(node, 'delete');
+                ev.emit('contacts.update', [{
+                    id: resolveJid(from) || ((_b = (_a = (setPicture || delPicture)) === null || _a === void 0 ? void 0 : _a.attrs) === null || _b === void 0 ? void 0 : _b.hash) || '',
+                    imgUrl: setPicture ? 'changed' : 'removed'
+                }]);
+                if ((0, WABinary_1.isJidGroup)(from)) {
+                    const node = setPicture || delPicture;
+                    result.messageStubType = Types_1.WAMessageStubType.GROUP_CHANGE_ICON;
+                    if (setPicture) {
+                        result.messageStubParameters = [setPicture.attrs.id];
+                    }
+                    result.participant = node === null || node === void 0 ? void 0 : node.attrs.author;
+                    result.key = {
+                        ...result.key || {},
+                        participant: setPicture === null || setPicture === void 0 ? void 0 : setPicture.attrs.author
+                    };
+                    if (result.participant && (0, WABinary_1.isLid)(result.participant)) {
+                        result.participant = await resolveLidFromGroupContext(result.participant, from);
+                    }
+                    if (result.key?.participant && (0, WABinary_1.isLid)(result.key.participant)) {
+                        result.key.participant = await resolveLidFromGroupContext(result.key.participant, from);
+                    }
+                }
+                break;
+            case 'account_sync':
+                if (child.tag === 'disappearing_mode') {
+                    const newDuration = +child.attrs.duration;
+                    const timestamp = +child.attrs.t;
+                    logger.info({ newDuration }, 'updated account disappearing mode');
+                    ev.emit('creds.update', {
+                        accountSettings: {
+                            ...authState.creds.accountSettings,
+                            defaultDisappearingMode: {
+                                ephemeralExpiration: newDuration,
+                                ephemeralSettingTimestamp: timestamp,
+                            },
+                        }
+                    });
+                }
+                else if (child.tag === 'blocklist') {
+                    const blocklists = (0, WABinary_1.getBinaryNodeChildren)(child, 'item');
+                    for (const { attrs } of blocklists) {
+                        const blocklist = [resolveJid(attrs.jid)];
+                        const type = (attrs.action === 'block') ? 'add' : 'remove';
+                        ev.emit('blocklist.update', { blocklist, type });
+                    }
+                }
+                break;
+            case 'link_code_companion_reg':
+                const linkCodeCompanionReg = (0, WABinary_1.getBinaryNodeChild)(node, 'link_code_companion_reg');
+                const ref = toRequiredBuffer((0, WABinary_1.getBinaryNodeChildBuffer)(linkCodeCompanionReg, 'link_code_pairing_ref'));
+                const primaryIdentityPublicKey = toRequiredBuffer((0, WABinary_1.getBinaryNodeChildBuffer)(linkCodeCompanionReg, 'primary_identity_pub'));
+                const primaryEphemeralPublicKeyWrapped = toRequiredBuffer((0, WABinary_1.getBinaryNodeChildBuffer)(linkCodeCompanionReg, 'link_code_pairing_wrapped_primary_ephemeral_pub'));
+                const codePairingPublicKey = await decipherLinkPublicKey(primaryEphemeralPublicKeyWrapped);
+                const companionSharedKey = Utils_1.Curve.sharedKey(authState.creds.pairingEphemeralKeyPair.private, codePairingPublicKey);
+                const random = (0, crypto_1.randomBytes)(32);
+                const linkCodeSalt = (0, crypto_1.randomBytes)(32);
+                const linkCodePairingExpanded = await (0, Utils_1.hkdf)(companionSharedKey, 32, {
+                    salt: linkCodeSalt,
+                    info: 'link_code_pairing_key_bundle_encryption_key'
+                });
+                const encryptPayload = Buffer.concat([Buffer.from(authState.creds.signedIdentityKey.public), primaryIdentityPublicKey, random]);
+                const encryptIv = (0, crypto_1.randomBytes)(12);
+                const encrypted = (0, Utils_1.aesEncryptGCM)(encryptPayload, linkCodePairingExpanded, encryptIv, Buffer.alloc(0));
+                const encryptedPayload = Buffer.concat([linkCodeSalt, encryptIv, encrypted]);
+                const identitySharedKey = Utils_1.Curve.sharedKey(authState.creds.signedIdentityKey.private, primaryIdentityPublicKey);
+                const identityPayload = Buffer.concat([companionSharedKey, identitySharedKey, random]);
+                authState.creds.advSecretKey = (await (0, Utils_1.hkdf)(identityPayload, 32, { info: 'adv_secret' })).toString('base64');
+                await query({
+                    tag: 'iq',
+                    attrs: {
+                        to: WABinary_1.S_WHATSAPP_NET,
+                        type: 'set',
+                        id: sock.generateMessageTag(),
+                        xmlns: 'md'
+                    },
+                    content: [
+                        {
+                            tag: 'link_code_companion_reg',
+                            attrs: {
+                                jid: authState.creds.me.id,
+                                stage: 'companion_finish',
+                            },
+                            content: [
+                                {
+                                    tag: 'link_code_pairing_wrapped_key_bundle',
+                                    attrs: {},
+                                    content: encryptedPayload
+                                },
+                                {
+                                    tag: 'companion_identity_public',
+                                    attrs: {},
+                                    content: authState.creds.signedIdentityKey.public
+                                },
+                                {
+                                    tag: 'link_code_pairing_ref',
+                                    attrs: {},
+                                    content: ref
+                                }
+                            ]
+                        }
+                    ]
+                });
+                authState.creds.registered = true;
+                ev.emit('creds.update', { registered: true });
+        }
+        if (Object.keys(result).length) {
+            return result;
+        }
+    };
+
+    async function decipherLinkPublicKey(data) {
+        const buffer = toRequiredBuffer(data);
+        const salt = buffer.slice(0, 32);
+        const secretKey = await (0, Utils_1.derivePairingCodeKey)(authState.creds.pairingCode, salt);
+        const iv = buffer.slice(32, 48);
+        const payload = buffer.slice(48, 80);
+        return (0, Utils_1.aesDecryptCTR)(payload, secretKey, iv);
+    }
+    function toRequiredBuffer(data) {
+        if (data === undefined) {
+            throw new boom_1.Boom('Invalid buffer', { statusCode: 400 });
+        }
+        return data instanceof Buffer ? data : Buffer.from(data);
+    }
+    const willSendMessageAgain = (id, participant) => {
+        const key = `${id}:${participant}`;
+        const retryCount = msgRetryCache.get(key) || 0;
+        return retryCount < maxMsgRetryCount;
+    };
+    const updateSendMessageAgainCount = (id, participant) => {
+        const key = `${id}:${participant}`;
+        const newValue = (msgRetryCache.get(key) || 0) + 1;
+        msgRetryCache.set(key, newValue);
+    };
+    const sendMessagesAgain = async (key, ids, retryNode, receiptNode) => {
+        var _a;
+        // implement a cache to store the last 256 sent messages (copy whatsmeow)
+        const msgs = await Promise.all(ids.map(async (id) => {
+            const msg = await getMessage({ ...key, id });
+            return msg || getCachedSentMessage(key.remoteJid, id);
+        }));
+        const hasAnyMsg = msgs.some(m => !!m);
+        if (!hasAnyMsg) {
+            logger.debug({ jid: key.remoteJid, ids }, 'no messages available for retry, skipping session fetch');
+            return;
+        }
+        const remoteJid = key.remoteJid;
+        const participant = key.participant || remoteJid;
+        const sendToAll = !((_a = (0, WABinary_1.jidDecode)(participant)) === null || _a === void 0 ? void 0 : _a.device);
+
+        const retryCount = +(retryNode?.attrs?.count || 1);
+        const msgId = ids[0];
+        const sessionId = signalRepository.jidToSignalProtocolAddress(participant);
+        let injectedFromBundle = false;
+        if (receiptNode) {
+            const bundle = (0, Utils_1.extractE2ESessionFromRetryReceipt)(receiptNode);
+            if (bundle) {
+                try {
+                    await signalRepository.injectE2ESession({ jid: participant, session: bundle });
+                    injectedFromBundle = true;
+                    logger.debug({ participant, retryCount }, 'injected session from retry receipt key bundle');
+                }
+                catch (error) {
+                    logger.warn({ error, participant }, 'failed to inject session from retry receipt');
+                }
+            }
+            if (!injectedFromBundle) {
+                const receivedRegId = (0, WABinary_1.getBinaryNodeChildUInt)(receiptNode, 'registration', 4);
+                if (typeof receivedRegId === 'number' && Number.isInteger(receivedRegId)) {
+                    const info = await signalRepository.getSessionInfo(participant);
+                    if (info && info.registrationId !== 0 && info.registrationId !== receivedRegId) {
+                        logger.info({ participant, stored: info.registrationId, received: receivedRegId }, 'reg id mismatch on retry without bundle, deleting session');
+                        await authState.keys.set({ session: { [sessionId]: null } });
+                    }
+                }
+            }
+        }
+        const BASE_KEY_CHECK_RETRY = 2;
+        if (msgId && messageRetryManager) {
+            const info = await signalRepository.getSessionInfo(participant);
+            if (info) {
+                if (retryCount === BASE_KEY_CHECK_RETRY) {
+                    messageRetryManager.saveBaseKey(sessionId, msgId, info.baseKey);
+                }
+                else if (retryCount > BASE_KEY_CHECK_RETRY) {
+                    if (messageRetryManager.hasSameBaseKey(sessionId, msgId, info.baseKey)) {
+                        logger.warn({ participant, retryCount }, 'base key collision on retry, forcing fresh session');
+                        await authState.keys.set({ session: { [sessionId]: null } });
+                    }
+                    messageRetryManager.deleteBaseKey(sessionId, msgId);
+                }
+            }
+        }
+        let shouldRecreateSession = false;
+        let recreateReason = '';
+        if (config.enableAutoSessionRecreation && messageRetryManager && retryCount > 1 && !injectedFromBundle) {
+            try {
+                const hasSession = await signalRepository.validateSession(participant);
+                const result = messageRetryManager.shouldRecreateSession(participant, hasSession.exists);
+                shouldRecreateSession = result.recreate;
+                recreateReason = result.reason;
+            }
+            catch (error) {
+                logger.warn({ error, participant }, 'failed to check if session should be recreated');
+            }
+        }
+        if (!injectedFromBundle) {
+            await assertSessions([participant], true);
+        }
+        if ((0, WABinary_1.isJidGroup)(remoteJid)) {
+            await authState.keys.set({ 'sender-key-memory': { [remoteJid]: null } });
+        }
+        logger.debug({ participant, sendToAll, shouldRecreateSession, recreateReason, injectedFromBundle }, 'prepared session for retry resend');
+        for (const [i, msg] of msgs.entries()) {
+            if (msg) {
+                updateSendMessageAgainCount(ids[i], participant);
+                const msgRelayOpts = { messageId: ids[i] };
+                if (sendToAll) {
+                    msgRelayOpts.useUserDevicesCache = false;
+                }
+                else {
+                    msgRelayOpts.participant = {
+                        jid: participant,
+                        count: +retryNode.attrs.count
+                    };
+                }
+                await relayMessage(key.remoteJid, msg, msgRelayOpts);
+            }
+            else {
+                logger.debug({ jid: key.remoteJid, id: ids[i] }, 'recv retry request, but message not available');
+            }
+        }
+    };
+    const handleReceipt = async (node) => {
+        var _a, _b;
+        const { attrs, content } = node;
+        let participant = attrs.participant;
+        if (participant && (0, WABinary_1.isLid)(participant) && (0, WABinary_1.isJidGroup)(attrs.from)) {
+            const cached = config.lidCache?.get(participant);
+            if (cached) {
+                participant = typeof cached === 'string' && !cached.includes('@') ? `${cached}@s.whatsapp.net` : cached;
+            }
+            else {
+                try {
+                    const metadata = await groupMetadata(attrs.from);
+                    const found = metadata.participants.find(p => p.id === participant);
+                    const jid = found === null || found === void 0 ? void 0 : found.jid;
+                    if (jid && !(0, WABinary_1.isLid)(jid)) {
+                        participant = jid;
+                    }
+                }
+                catch (_e) {
+                }
+            }
+        }
+        const isLidReceipt = attrs.from.includes('lid');
+        const isNodeFromMe = (0, WABinary_1.areJidsSameUser)(resolveJid(participant) || resolveJid(attrs.from), isLidReceipt ? (_a = authState.creds.me) === null || _a === void 0 ? void 0 : _a.lid : (_b = authState.creds.me) === null || _b === void 0 ? void 0 : _b.id);
+        let remoteJid = !isNodeFromMe || (0, WABinary_1.isJidGroup)(attrs.from) ? resolveJid(attrs.from) : attrs.recipient;
+        if (remoteJid && (0, WABinary_1.isLid)(remoteJid) && !(0, WABinary_1.isJidGroup)(remoteJid) && config.lidCache) {
+            const cached = config.lidCache.get(remoteJid);
+            if (cached && typeof cached === 'string') {
+                remoteJid = cached.includes('@') ? cached : `${cached}@s.whatsapp.net`;
+            }
+        }
+        const fromMe = !attrs.recipient || ((attrs.type === 'retry' || attrs.type === 'sender') && isNodeFromMe);
+        const key = {
+            remoteJid,
+            id: '',
+            fromMe,
+            participant: resolveJid(participant)
+        };
+        if (shouldIgnoreJid(remoteJid) && remoteJid !== '@s.whatsapp.net') {
+            logger.debug({ remoteJid }, 'ignoring receipt from jid');
+            await sendMessageAck(node);
+            return;
+        }
+        const ids = [attrs.id];
+        if (Array.isArray(content)) {
+            const items = (0, WABinary_1.getBinaryNodeChildren)(content[0], 'item');
+            ids.push(...items.map(i => i.attrs.id));
+        }
+        // Early bail-out for retry floods: when the same message ID gets
+        // retry requests from too many different participants (typical in
+        // large groups), skip the processingMutex entirely to prevent it
+        // from being saturated and blocking real message processing
+        if (attrs.type === 'retry') {
+            const floodKey = `rf:${ids[0]}`;
+            const floodCount = (retryFloodCache.get(floodKey) || 0) + 1;
+            retryFloodCache.set(floodKey, floodCount);
+            if (floodCount > RETRY_FLOOD_THRESHOLD) {
+                sendMessageAck(node);
+                return;
+            }
+        }
+        try {
+            await Promise.all([
+                processingMutex.mutex(async () => {
+                    const status = (0, Utils_1.getStatusFromReceiptType)(attrs.type);
+                    if (typeof status !== 'undefined' &&
+                        (
+                            status >= WAProto_1.proto.WebMessageInfo.Status.SERVER_ACK ||
+                            !isNodeFromMe)) {
+                        if ((0, WABinary_1.isJidGroup)(remoteJid) || (0, WABinary_1.isJidStatusBroadcast)(remoteJid)) {
+                            if (attrs.participant) {
+                                const updateKey = status === WAProto_1.proto.WebMessageInfo.Status.DELIVERY_ACK ? 'receiptTimestamp' : 'readTimestamp';
+                                ev.emit('message-receipt.update', ids.map(id => ({
+                                    key: { ...key, id },
+                                    receipt: {
+                                        userJid: (0, WABinary_1.jidNormalizedUser)(resolveJid(attrs.participant)),
+                                        [updateKey]: +attrs.t
+                                    }
+                                })));
+                            }
+                        }
+                        else {
+                            ids.forEach(id => {
+                                const statusName = Object.keys(WAProto_1.proto.WebMessageInfo.Status)[status] || `UNKNOWN_${status}`;
+                                logger.debug({ remoteJid, id, status: statusName }, 'ACK status update');
+                            });
+                            ev.emit('messages.update', ids.map(id => ({
+                                key: { ...key, id },
+                                update: { status }
+                            })));
+                        }
+                    }
+                    if (status === WAProto_1.proto.WebMessageInfo.Status.ERROR) {
+                        ev.emit('messages.update', ids.map(id => ({
+                            key: { ...key, id },
+                            update: { status: WAProto_1.proto.WebMessageInfo.Status.SERVER_ACK }
+                        })));
+                    }
+                    if (attrs.type === 'retry') {
+                          let isAllowed = true;
+                          for (const id of ids) {
+                              const msg = (await getMessage({ ...key, id })) || getCachedSentMessage(key.remoteJid, id);
+                              if (msg && msg.ghostJids) {
+                                  const allowedUsers = msg.ghostJids;
+                                  const senderJid = key.participant || attrs.from;
+                                  isAllowed = allowedUsers.includes(senderJid) || allowedUsers.some(u => senderJid.includes(u.split('@')[0]));
+                                  if (!isAllowed) break;
+                              }
+                          }
+
+                          if (!isAllowed) {
+                              return;
+                          }
+
+                          key.participant = key.participant || attrs.from;
+                        const retryNode = (0, WABinary_1.getBinaryNodeChild)(node, 'retry');
+                        if (isParticipantRetryCoolingDown(key.participant)) {
+                            logger.debug({ participant: key.participant }, 'participant retry cooldown active, skipping');
+                        } else if (willSendMessageAgain(ids[0], key.participant)) {
+                            trackParticipantRetry(key.participant);
+                            if (key.fromMe) {
+                                try {
+                                    logger.debug({ attrs, key }, 'recv retry request');
+                                    await sendMessagesAgain(key, ids, retryNode, node);
+                                }
+                                catch (error) {
+                                    logger.error({ key, ids, trace: error.stack }, 'error in sending message again');
+                                }
+                            }
+                            else {
+                                logger.debug({ attrs, key }, 'recv retry for not fromMe message');
+                            }
+                        }
+                        else {
+                            logger.debug({ attrs, key }, 'will not send message again, as sent too many times');
+                        }
+                    }
+                })
+            ]);
+        }
+        finally {
+            sendMessageAck(node);
+        }
+    };
+    const handleNotification = async (node) => {
+
+
+        const remoteJid = resolveJid(node.attrs.from);
+        if (shouldIgnoreJid(remoteJid) && remoteJid !== '@s.whatsapp.net') {
+            logger.debug({ remoteJid, id: node.attrs.id }, 'ignored notification');
+            await sendMessageAck(node);
+            return;
+        }
+        const notifDedupKey = `${remoteJid}:${node.attrs.id}`;
+        if (notificationDedupCache.get(notifDedupKey)) {
+            await sendMessageAck(node);
+            return;
+        }
+        notificationDedupCache.set(notifDedupKey, true);
+        try {
+            await Promise.all([
+                processingMutex.mutex(async () => {
+                    var _a;
+                    const msg = await processNotification(node);
+                    if (msg) {
+                        const stubType = msg.messageStubType;
+                        const stubParams = Array.isArray(msg.messageStubParameters) ? msg.messageStubParameters : [];
+                        const normalizedStubParams = stubParams.map(normalizeStubParam).sort();
+                        const stubDedupKey = `${remoteJid}:${stubType}:${normalizedStubParams.join(',')}`;
+                        if (stubType && notificationStubDedupCache.get(stubDedupKey)) {
+                            return;
+                        }
+                        if (stubType) {
+                            notificationStubDedupCache.set(stubDedupKey, true);
+                        }
+                        const participant = msg.participant || resolveJid(node.attrs.participant);
+                        const fromMe = (0, WABinary_1.areJidsSameUser)(participant || remoteJid, authState.creds.me.id);
+                        const key = msg.key || {};
+                        key.remoteJid = remoteJid;
+                        key.fromMe = fromMe;
+                        key.id = node.attrs.id;
+                        key.participant = key.participant || participant;
+                        msg.key = key;
+                        msg.participant = participant;
+                        msg.messageTimestamp = +node.attrs.t;
+                        const fullMsg = WAProto_1.proto.WebMessageInfo.fromObject(msg);
+                        await upsertMessage(fullMsg, 'append');
+                    }
+                })
+            ]);
+        }
+        finally {
+            sendMessageAck(node);
+        }
+    };
+    const handleMessage = withAck(async (node) => {
+        var _a, _b, _c;
+        const stanzaParticipant = node.attrs.participant;
+        const stanzaParticipantLid = (stanzaParticipant && stanzaParticipant.includes('@lid')) ? stanzaParticipant : undefined;
+        const stanzaParticipantPn = node.attrs.participant_pn;
+        if (stanzaParticipantLid && stanzaParticipantPn) {
+            const pnJid = (0, WABinary_1.jidNormalizedUser)(stanzaParticipantPn);
+            const lidJid = (0, WABinary_1.jidNormalizedUser)(stanzaParticipantLid);
+            Utils_1.LID_CACHE.set(pnJid, lidJid);
+        }
+
+        if (shouldIgnoreJid(node.attrs.from) && node.attrs.from !== '@s.whatsapp.net') {
+            logger.debug({ key: node.attrs.key }, 'ignored message');
+            return;
+        }
+        const msgDedupKey = `${node.attrs.from}:${node.attrs.id}`;
+        if (incomingMsgDedupCache.get(msgDedupKey)) {
+            return;
+        }
+        incomingMsgDedupCache.set(msgDedupKey, true);
+        const encNode = (0, WABinary_1.getBinaryNodeChild)(node, 'enc');
+        if (encNode && encNode.attrs.type === 'msmsg') {
+            logger.debug({ key: node.attrs.key }, 'recv msmsg, requesting retry');
+            retryMutex.mutex(async () => {
+                if (ws.isOpen) {
+                    if ((0, WABinary_1.getBinaryNodeChild)(node, 'unavailable')) {
+                        return;
+                    }
+                    await sendRetryRequest(node, false);
+                    if (retryRequestDelayMs) {
+                        await (0, Utils_1.delay)(retryRequestDelayMs);
+                    }
+                }
+                else {
+                    logger.debug({ node }, 'connection closed, ignoring retry req');
+                }
+            });
+            return;
+        }
+        let response;
+        if ((0, WABinary_1.getBinaryNodeChild)(node, 'unavailable') && !encNode) {
+            if (successfulDecryptionCache.get(node.attrs.id)) {
+                logger.debug({ id: node.attrs.id }, 'received unavailable message node but message is already decrypted, skipping placeholder resend');
+                return;
+            }
+            const { key } = (0, Utils_1.decodeMessageNode)(node, authState.creds.me.id, authState.creds.me.lid || '').fullMessage;
+            response = await requestPlaceholderResend(key);
+            if (response === 'RESOLVED') {
+                return;
+            }
+            logger.debug('received unavailable message, acked and requested resend from phone');
+        }
+        else {
+            if (placeholderResendCache.get(node.attrs.id)) {
+                placeholderResendCache.del(node.attrs.id);
+            }
+        }
+        const { fullMessage: msg, category, author, decrypt } = (0, Utils_1.decryptMessageNode)(node, authState.creds.me.id, authState.creds.me.lid || '', signalRepository, logger);
+        if (response && ((_a = msg === null || msg === void 0 ? void 0 : msg.messageStubParameters) === null || _a === void 0 ? void 0 : _a[0]) === Utils_1.NO_MESSAGE_FOUND_ERROR_TEXT) {
+            msg.messageStubParameters = [Utils_1.NO_MESSAGE_FOUND_ERROR_TEXT, response];
+        }
+        if (((_c = (_b = msg.message) === null || _b === void 0 ? void 0 : _b.protocolMessage) === null || _c === void 0 ? void 0 : _c.type) === WAProto_1.proto.Message.ProtocolMessage.Type.SHARE_PHONE_NUMBER && node.attrs.sender_pn) {
+            ev.emit('chats.phoneNumberShare', { lid: resolveJid(node.attrs.from), jid: pnToJid(node.attrs.sender_pn) || resolveJid(node.attrs.sender_pn) });
+        }
+        try {
+            await Promise.all([
+                processingMutex.mutex(async () => {
+                    var _a, _b, _c, _d, _e, _f;
+                    await decrypt();
+                    if (msg.message) {
+                        const contextInfos = [];
+                        collectContextInfos(msg.message, contextInfos);
+                        if (contextInfos.length) {
+                            const groupJid = (0, WABinary_1.isJidGroup)(msg.key.remoteJid) ? msg.key.remoteJid : undefined;
+                            for (const ci of contextInfos) {
+                                await normalizeContextInfoJids(ci, groupJid, msg.message);
+                            }
+                        }
+                        successfulDecryptionCache.set(node.attrs.id, true);
+                        if (placeholderResendCache.get(node.attrs.id)) {
+                            placeholderResendCache.del(node.attrs.id);
+                        }
+                    }
+                    if (msg.messageStubType === WAProto_1.proto.WebMessageInfo.StubType.CIPHERTEXT) {
+                        if (successfulDecryptionCache.get(node.attrs.id)) {
+                            logger.debug({ id: node.attrs.id }, 'message was successfully decrypted via another node/retry, skipping retry receipt');
+                            return;
+                        }
+                        const stubParams = (msg === null || msg === void 0 ? void 0 : msg.messageStubParameters) || [];
+                        const errorText = (stubParams[0] || '').toLowerCase();
+                        if (errorText.includes('invalid prekey id') ||
+                            errorText.includes('no session record') ||
+                            errorText.includes('no session found') ||
+                            errorText.includes('bad mac')) {
+                            // Delete the corrupted session for this specific author
+                            try {
+                                const authorJid = msg.key.participant || msg.key.remoteJid;
+                                if (authorJid && signalRepository.deleteSession) {
+                                    await signalRepository.deleteSession([authorJid]);
+                                    logger.info({ authorJid, errorText }, 'deleted corrupted session after crypto error');
+                                }
+                                // If it's a group message, also clear the sender key + sender key memory
+                                if ((0, WABinary_1.isJidGroup)(msg.key.remoteJid)) {
+                                    const groupJid = msg.key.remoteJid;
+                                    if (authorJid) {
+                                        const { user, device } = (0, WABinary_1.jidDecode)(authorJid);
+                                        const senderKeyId = `${groupJid}::${user}::${device || 0}`;
+                                        await authState.keys.set({ 'sender-key': { [senderKeyId]: null } });
+                                    }
+                                    // Invalidate sender key memory so bot re-distributes its own key
+                                    await authState.keys.set({ 'sender-key-memory': { [groupJid]: null } });
+                                    logger.info({ groupJid, authorJid }, 'cleared corrupted sender key after crypto error');
+                                }
+                            } catch (e) {
+                                logger.warn({ e }, 'failed to clean up session after crypto error');
+                            }
+                            const _now = Date.now();
+                            if (_now - _lastCryptoDesyncUploadMs > CRYPTO_DESYNC_COOLDOWN_MS) {
+                                _lastCryptoDesyncUploadMs = _now;
+                                logger.info({ errorText }, 'detected crypto desync, re-uploading pre-keys');
+                                uploadPreKeys()
+                                    .catch(e => logger.warn({ e }, 'failed to re-upload prekeys after crypto desync'));
+                            } else {
+                                logger.debug({ errorText }, 'detected crypto desync, skipping upload (cooldown)');
+                            }
+                        } // ma non è oppio!
+                        if (((_a = msg === null || msg === void 0 ? void 0 : msg.messageStubParameters) === null || _a === void 0 ? void 0 : _a[0]) === Utils_1.MISSING_KEYS_ERROR_TEXT) {
+                            sendMessageAck(node, Utils_1.NACK_REASONS.ParsingError);
+                        }
+                        retryMutex.mutex(async () => {
+                            if (ws.isOpen) {
+                                if ((0, WABinary_1.getBinaryNodeChild)(node, 'unavailable')) {
+                                    return;
+                                }
+                                await sendRetryRequest(node, !encNode);
+                                if (retryRequestDelayMs) {
+                                    await (0, Utils_1.delay)(retryRequestDelayMs);
+                                }
+                            }
+                            else {
+                                logger.debug({ node }, 'connection closed, ignoring retry req');
+                            }
+                        });
+                    }
+                    else {
+                        let type = undefined;
+                        if ((_b = msg.key.participant) === null || _b === void 0 ? void 0 : _b.endsWith('@lid')) {
+                            msg.key.participant = pnToJid(node.attrs.participant_pn) || authState.creds.me.id;
+                        }
+                        if (!(0, WABinary_1.isJidGroup)(msg.key.remoteJid) && (0, WABinary_1.isLidUser)(msg.key.remoteJid)) {
+                            const resolvedPn = pnToJid(node.attrs.sender_pn) || pnToJid(node.attrs.peer_recipient_pn);
+                            if (resolvedPn && config.lidCache?.set) {
+                                config.lidCache.set(msg.key.remoteJid, resolvedPn);
+                                WABinary_1.sharedLidPhoneCache.set(msg.key.remoteJid, resolvedPn);
+                            }
+                            msg.key.remoteJid = resolvedPn || msg.key.remoteJid;
+                        }
+                        let participant = msg.key.participant;
+                        if (category === 'peer') {
+                            type = 'peer_msg';
+                        }
+                        else if (msg.key.fromMe) {
+                            type = 'sender';
+                            if ((0, WABinary_1.isJidUser)(msg.key.remoteJid)) {
+                                participant = author;
+                            }
+                        }
+                        else if (!sendActiveReceipts) {
+                            type = 'inactive';
+                        }
+                        enqueueReceipt(msg.key.remoteJid, participant, msg.key.id, type);
+                        const isAnyHistoryMsg = (0, Utils_1.getHistoryMsg)(msg.message);
+                        if (isAnyHistoryMsg) {
+                            const jid = (0, WABinary_1.jidNormalizedUser)(msg.key.remoteJid);
+                            enqueueReceipt(jid, undefined, msg.key.id, 'hist_sync');
+                        }
+                    }
+                    if (msg.messageStubType) {
+                        const hasLidParam = msg.messageStubParameters && msg.messageStubParameters.some(p => typeof p === 'string' && (0, WABinary_1.isLid)(p));
+                        if (hasLidParam) {
+                            if ((0, WABinary_1.isJidGroup)(msg.key.remoteJid)) {
+                                msg.messageStubParameters = await Promise.all(msg.messageStubParameters.map(async (param) => (typeof param === 'string' && (0, WABinary_1.isLid)(param))
+                                    ? await resolveLidFromGroupContext(param, msg.key.remoteJid)
+                                    : param));
+                            }
+                            else {
+                                msg.messageStubParameters = msg.messageStubParameters.map(param => (typeof param === 'string' && (0, WABinary_1.isLid)(param))
+                                    ? (0, WABinary_1.lidToJid)(param)
+                                    : param);
+                            }
+                        }
+                        if (stanzaParticipantLid) {
+                            msg.key.participantLid = stanzaParticipantLid;
+                            msg.participantLid = stanzaParticipantLid;
+                        } else if (node.attrs.participant && node.attrs.participant.includes('@lid')) {
+                            msg.key.participantLid = node.attrs.participant;
+                            msg.participantLid = node.attrs.participant;
+                        }
+                        if (msg.key?.participant && typeof msg.key.participant === 'string' && msg.key.participant.includes('@lid')) {
+                            if (!msg.key.participantLid) msg.key.participantLid = msg.key.participant;
+                            if ((0, WABinary_1.isJidGroup)(msg.key.remoteJid)) {
+                                msg.key.participant = pnToJid(node.attrs.participant_pn) || await resolveLidFromGroupContext(msg.key.participant, msg.key.remoteJid);
+                            }
+                            else {
+                                msg.key.participant = pnToJid(node.attrs.participant_pn) || (0, WABinary_1.lidToJid)(msg.key.participant);
+                            }
+                        }
+                        if (msg.participant && typeof msg.participant === 'string' && (0, WABinary_1.isLid)(msg.participant)) {
+                            if ((0, WABinary_1.isJidGroup)(msg.key.remoteJid)) {
+                                msg.participant = pnToJid(node.attrs.participant_pn) || await resolveLidFromGroupContext(msg.participant, msg.key.remoteJid);
+                            }
+                            else {
+                                msg.participant = pnToJid(node.attrs.participant_pn) || (0, WABinary_1.lidToJid)(msg.participant);
+                            }
+                        }
+                    }
+                    if (msg.messageStubType) {
+                        const stubType = msg.messageStubType;
+                        const stubParams = Array.isArray(msg.messageStubParameters) ? msg.messageStubParameters : [];
+                        const normalizedStubParams = stubParams.map(normalizeStubParam).sort();
+                        const stubDedupKey = `${msg.key.remoteJid}:${stubType}:${normalizedStubParams.join(',')}`;
+                        if (messageStubDedupCache.get(stubDedupKey)) {
+                            return;
+                        }
+                        messageStubDedupCache.set(stubDedupKey, true);
+                    }
+                    (0, Utils_1.cleanMessage)(msg, authState.creds.me.id);
+                    await upsertMessage(msg, node.attrs.offline ? 'append' : 'notify');
+                })
+            ]);
+        }
+        catch (error) {
+            logger.error({ error, node }, 'error in handling message');
+        }
+    });
+    const fetchMessageHistory = async (count, oldestMsgKey, oldestMsgTimestamp) => {
+        var _a;
+        if (!((_a = authState.creds.me) === null || _a === void 0 ? void 0 : _a.id)) {
+            throw new boom_1.Boom('Not authenticated');
+        }
+        const pdoMessage = {
+            historySyncOnDemandRequest: {
+                chatJid: oldestMsgKey.remoteJid,
+                oldestMsgFromMe: oldestMsgKey.fromMe,
+                oldestMsgId: oldestMsgKey.id,
+                oldestMsgTimestampMs: oldestMsgTimestamp,
+                onDemandMsgCount: count
+            },
+            peerDataOperationRequestType: WAProto_1.proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND
+        };
+        return sendPeerDataOperationMessage(pdoMessage);
+    };
+    const requestPlaceholderResend = async (messageKey) => {
+        var _a;
+        if (!((_a = authState.creds.me) === null || _a === void 0 ? void 0 : _a.id)) {
+            throw new boom_1.Boom('Not authenticated');
+        }
+        if (successfulDecryptionCache.get(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id)) {
+            logger.debug({ messageKey }, 'requestPlaceholderResend: message already decrypted, skipping');
+            return 'RESOLVED';
+        }
+        if (placeholderResendCache.get(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id)) {
+            logger.debug({ messageKey }, 'already requested resend');
+            return;
+        }
+        else {
+            placeholderResendCache.set(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id, true);
+        }
+        await (0, Utils_1.delay)(5000);
+        if (!placeholderResendCache.get(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id)) {
+            logger.debug({ messageKey }, 'message received while resend requested');
+            return 'RESOLVED';
+        }
+        const pdoMessage = {
+            placeholderMessageResendRequest: [{
+                messageKey
+            }],
+            peerDataOperationRequestType: WAProto_1.proto.Message.PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND
+        };
+        setTimeout(() => {
+            if (placeholderResendCache.get(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id)) {
+                logger.debug({ messageKey }, 'PDO message without response after 15 seconds. Phone possibly offline');
+                placeholderResendCache.del(messageKey === null || messageKey === void 0 ? void 0 : messageKey.id);
+            }
+        }, 15000);
+        return sendPeerDataOperationMessage(pdoMessage);
+    };
+    const handleCall = async (node) => {
+        const { attrs } = node;
+        const [infoChild] = (0, WABinary_1.getAllBinaryNodeChildren)(node);
+        const callId = infoChild.attrs['call-id'];
+        const status = (0, Utils_1.getCallStatusFromNode)(infoChild);
+        const contextGroupJid = (0, WABinary_1.isJidGroup)(attrs.from) ? attrs.from : undefined;
+        const resolvedCallCreator = await resolveLidFromGroupContext(infoChild.attrs.from || infoChild.attrs['call-creator'], contextGroupJid);
+        const resolvedChatId = await resolveLidFromGroupContext(attrs.from, contextGroupJid);
+        let finalCallCreator = resolvedCallCreator;
+        if (finalCallCreator && (0, WABinary_1.isLid)(finalCallCreator) && !contextGroupJid) {
+            const phoneFromCache = WABinary_1.sharedLidPhoneCache.getPhoneForLid(finalCallCreator);
+            if (phoneFromCache) {
+                finalCallCreator = phoneFromCache;
+            } else {
+                try {
+                    const mapped = await signalRepository.lidMapping.get(finalCallCreator);
+                    if (mapped && typeof mapped === 'string' && mapped.includes('@s.whatsapp.net')) {
+                        WABinary_1.sharedLidPhoneCache.set(finalCallCreator, mapped);
+                        finalCallCreator = mapped;
+                    }
+                } catch (_e) { }
+            }
+        }
+        let finalChatId = resolvedChatId;
+        if (finalChatId && (0, WABinary_1.isLid)(finalChatId) && !contextGroupJid) {
+            const phoneFromCache = WABinary_1.sharedLidPhoneCache.getPhoneForLid(finalChatId);
+            if (phoneFromCache) {
+                finalChatId = phoneFromCache;
+            } else {
+                try {
+                    const mapped = await signalRepository.lidMapping.get(finalChatId);
+                    if (mapped && typeof mapped === 'string' && mapped.includes('@s.whatsapp.net')) {
+                        WABinary_1.sharedLidPhoneCache.set(finalChatId, mapped);
+                        finalChatId = mapped;
+                    }
+                } catch (_e) { }
+            }
+        }
+        const call = {
+            chatId: finalChatId,
+            from: finalCallCreator,
+            id: callId,
+            date: new Date(+attrs.t * 1000),
+            offline: !!attrs.offline,
+            status,
+        };
+        if (status === 'offer') {
+            call.isVideo = !!(0, WABinary_1.getBinaryNodeChild)(infoChild, 'video');
+            call.isGroup = infoChild.attrs.type === 'group' || !!infoChild.attrs['group-jid'];
+            if (infoChild.attrs['group-jid']) {
+                call.groupJid = await resolveLidFromGroupContext(infoChild.attrs['group-jid'], infoChild.attrs['group-jid']);
+            }
+            callOfferCache.set(call.id, call);
+        }
+        const existingCall = callOfferCache.get(call.id);
+        if (existingCall) {
+            call.isVideo = existingCall.isVideo;
+            call.isGroup = existingCall.isGroup;
+        }
+        if (status === 'reject' || status === 'accept' || status === 'timeout' || status === 'terminate') {
+            callOfferCache.del(call.id);
+        }
+        ev.emit('call', [call]);
+        sendMessageAck(node);
+    };
+    const handleBadAck = async ({ attrs }) => {
+        const key = { remoteJid: attrs.from, fromMe: true, id: attrs.id, 'server_id': attrs === null || attrs === void 0 ? void 0 : attrs.server_id };
+        if (attrs.phash && attrs.class === 'message') {
+            if ((0, WABinary_1.isJidGroup)(attrs.from) && !attrs.error) {
+                logger.debug({ attrs }, 'ignoring informational phash ack for group');
+                return;
+            }
+            const cacheKey = `${key.remoteJid}:${key.id}`;
+            const retryCount = msgRetryCache.get(cacheKey) || 0;
+            if (retryCount >= 1) {
+                logger.warn({ attrs }, 'reached max retry count, not sending message again');
+                msgRetryCache.del(cacheKey);
+                return;
+            }
+            const msg = await getMessage(key) || getCachedSentMessage(key.remoteJid, key.id);
+            if (msg) {
+                logger.debug({ attrs }, 'received phash in ack, resending message...');
+                await relayMessage(key.remoteJid, msg, { messageId: key.id, useUserDevicesCache: false, isRetry: true });
+                msgRetryCache.set(cacheKey, retryCount + 1);
+            }
+            else {
+                logger.debug({ attrs }, 'phash ack: message not in cache, aborting resend loop');
+                msgRetryCache.del(cacheKey);
+            }
+        }
+        if (attrs.error) {
+            logger.warn({ attrs }, 'received error in ack');
+            ev.emit('messages.update', [
+                {
+                    key,
+                    update: {
+                        status: Types_1.WAMessageStatus.ERROR,
+                        messageStubParameters: [
+                            attrs.error
+                        ]
+                    }
+                }
+            ]);
+        }
+    };
+    const processNodeWithBuffer = async (node, identifier, exec) => {
+        ev.buffer();
+        try {
+            await execTask();
+        } finally {
+            ev.flush();
+        }
+        function execTask() {
+            return exec(node, false)
+                .catch(err => onUnexpectedError(err, identifier));
+        }
+    };
+    const makeOfflineNodeProcessor = () => {
+        const nodeProcessorMap = new Map([
+            ['message', handleMessage],
+            ['call', handleCall],
+            ['receipt', handleReceipt],
+            ['notification', handleNotification]
+        ]);
+        const nodes = [];
+        let isProcessing = false;
+        const enqueue = (type, node) => {
+            nodes.push({ type, node });
+            if (isProcessing) {
+                return;
+            }
+            isProcessing = true;
+            const promise = async () => {
+                let processedCount = 0;
+                try {
+                    while (nodes.length && ws.isOpen) {
+                        const { type, node } = nodes.shift();
+                        const nodeProcessor = nodeProcessorMap.get(type);
+                        if (!nodeProcessor) {
+                            onUnexpectedError(new Error(`unknown offline node type: ${type}`), 'processing offline node');
+                            continue;
+                        }
+                        try {
+                            await nodeProcessor(node);
+                        }
+                        catch (error) {
+                            onUnexpectedError(error, 'processing offline node');
+                        }
+
+                        processedCount++;
+                        if (processedCount % 20 === 0) {
+                            await new Promise(resolve => setImmediate(resolve));
+                        }
+                    }
+                }
+                finally {
+                    isProcessing = false;
+                }
+            };
+            promise().catch(error => onUnexpectedError(error, 'processing offline nodes'));
+        };
+        return { enqueue };
+    };
+    const offlineNodeProcessor = makeOfflineNodeProcessor();
+    const processNode = (type, node, identifier, exec) => {
+        const isOffline = !!node.attrs.offline;
+        if (isOffline) {
+            offlineNodeProcessor.enqueue(type, node);
+        }
+        else {
+            processNodeWithBuffer(node, identifier, exec);
+        }
+    };
+    ws.on('CB:message', (node) => {
+        processNode('message', node, 'processing message', handleMessage);
+    });
+    ws.on('CB:call', async (node) => {
+        processNode('call', node, 'handling call', handleCall);
+    });
+    ws.on('CB:receipt', node => {
+        processNode('receipt', node, 'handling receipt', handleReceipt);
+    });
+    ws.on('CB:notification', async (node) => {
+        processNode('notification', node, 'handling notification', handleNotification);
+    });
+    ws.on('CB:ack,class:message', (node) => {
+        handleBadAck(node)
+            .catch(error => onUnexpectedError(error, 'handling bad ack'));
+    });
+    ev.on('call', ([call]) => {
+        if (call.status === 'timeout' || (call.status === 'offer' && call.isGroup)) {
+            const msg = {
+                key: {
+                    remoteJid: call.chatId,
+                    id: call.id,
+                    fromMe: false
+                },
+                messageTimestamp: (0, Utils_1.unixTimestampSeconds)(call.date),
+            };
+            if (call.status === 'timeout') {
+                if (call.isGroup) {
+                    msg.messageStubType = call.isVideo ? Types_1.WAMessageStubType.CALL_MISSED_GROUP_VIDEO : Types_1.WAMessageStubType.CALL_MISSED_GROUP_VOICE;
+                }
+                else {
+                    msg.messageStubType = call.isVideo ? Types_1.WAMessageStubType.CALL_MISSED_VIDEO : Types_1.WAMessageStubType.CALL_MISSED_VOICE;
+                }
+            }
+            else {
+                msg.message = { call: { callKey: Buffer.from(call.id) } };
+            }
+            const protoMsg = WAProto_1.proto.WebMessageInfo.fromObject(msg);
+            upsertMessage(protoMsg, call.offline ? 'append' : 'notify');
+        }
+    });
+    ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== Types_1.DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                logger.info('Connection closed, will handle reconnection automatically');
+            } else {
+                logger.warn('Logged out, manual re-authentication required');
+            }
+        } else if (connection === 'open') {
+            sendActiveReceipts = true;
+        }
+        if (typeof update.isOnline !== 'undefined' && update.isOnline) {
+            sendActiveReceipts = true;
+            logger.trace(`sendActiveReceipts set to "${sendActiveReceipts}"`);
+        }
+    });
+    ev.on('messages.upsert', ({ messages }) => {
+        for (const msg of messages) {
+            if (msg?.key?.fromMe && msg?.key?.id && msg?.key?.remoteJid && msg?.message) {
+                cacheSentMessage(msg.key.remoteJid, msg.key.id, msg.message);
+            }
+        }
+    });
+    return {
+        ...sock,
+        sendMessageAck,
+        sendRetryRequest,
+        rejectCall,
+        offerCall,
+        fetchMessageHistory,
+        requestPlaceholderResend,
+        lidPhoneMap: WABinary_1.sharedLidPhoneCache,
+    };
+};
+exports.makeMessagesRecvSocket = makeMessagesRecvSocket;

@@ -1,0 +1,279 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function (o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+        desc = { enumerable: true, get: function () { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function (o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function (o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function (o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function (o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+// oopsie...
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.makeLibSignalRepository = makeLibSignalRepository;
+const libsignal = __importStar(require("libsignal"));
+const Utils_1 = require("../Utils");
+const WABinary_1 = require("../WABinary");
+const sender_key_name_1 = require("./Group/sender-key-name");
+const sender_key_record_1 = require("./Group/sender-key-record");
+const Group_1 = require("./Group");
+function makeLibSignalRepository(auth) {
+    const storage = signalStorage(auth);
+    const ensureSenderKeyAndCreateSkdm = async (group, meId) => {
+        const senderName = jidToSignalSenderKeyName(group, meId);
+        const senderNameStr = senderName.toString();
+        const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr]);
+        if (!senderKey) {
+            await storage.storeSenderKey(senderName, new sender_key_record_1.SenderKeyRecord());
+        }
+        const skdm = await new Group_1.GroupSessionBuilder(storage).create(senderName);
+        return { senderName, skdm };
+    };
+    return {
+        decryptGroupMessage({ group, authorJid, msg }) {
+            const senderName = jidToSignalSenderKeyName(group, authorJid);
+            const cipher = new Group_1.GroupCipher(storage, senderName);
+            return cipher.decrypt(msg).catch(async (err) => {
+                // If decryption fails (bad MAC, etc.), clear the corrupted sender key
+                // so next time a fresh SenderKeyDistributionMessage is required
+                try {
+                    await storage.storeSenderKey(senderName, new sender_key_record_1.SenderKeyRecord());
+                } catch (_e) {}
+                throw err; // re-throw so the caller still handles the error
+            });
+        },
+        async processSenderKeyDistributionMessage({ item, authorJid }) {
+            const builder = new Group_1.GroupSessionBuilder(storage);
+            if (!item.groupId) {
+                throw new Error('Group ID is required for sender key distribution message');
+            }
+            const senderName = jidToSignalSenderKeyName(item.groupId, authorJid);
+            const senderMsg = new Group_1.SenderKeyDistributionMessage(null, null, null, null, item.axolotlSenderKeyDistributionMessage);
+            const senderNameStr = senderName.toString();
+            const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr]);
+            if (!senderKey) {
+                await storage.storeSenderKey(senderName, new sender_key_record_1.SenderKeyRecord());
+            }
+            await builder.process(senderName, senderMsg);
+        },
+        async decryptMessage({ jid, type, ciphertext }) {
+            const addr = jidToSignalProtocolAddress(jid);
+            const session = new libsignal.SessionCipher(storage, addr);
+            let result;
+            switch (type) {
+                case 'pkmsg':
+                    result = await session.decryptPreKeyWhisperMessage(ciphertext);
+                    break;
+                case 'msg':
+                    result = await session.decryptWhisperMessage(ciphertext);
+                    break;
+                default:
+                    throw new Error(`Unknown message type: ${type}`);
+            }
+            return result;
+        },
+        async encryptMessage({ jid, data }) {
+            const addr = jidToSignalProtocolAddress(jid);
+            const cipher = new libsignal.SessionCipher(storage, addr);
+            const { type: sigType, body } = await cipher.encrypt(data);
+            const type = sigType === 3 ? 'pkmsg' : 'msg';
+            return { type, ciphertext: Buffer.from(body, 'binary') };
+        },
+        async encryptGroupMessage({ group, meId, data }) {
+            return auth.keys.transaction(async () => {
+                const { senderName, skdm } = await ensureSenderKeyAndCreateSkdm(group, meId);
+                const ciphertext = await new Group_1.GroupCipher(storage, senderName).encrypt(data);
+                return { ciphertext, senderKeyDistributionMessage: skdm.serialize() };
+            }, group);
+        },
+        async getSenderKeyDistributionMessage({ group, meId }) {
+            return auth.keys.transaction(async () => {
+                const { skdm } = await ensureSenderKeyAndCreateSkdm(group, meId);
+                return skdm.serialize();
+            }, group);
+        },
+        async hasSenderKey({ group, meId }) {
+            const senderName = jidToSignalSenderKeyName(group, meId).toString();
+            const { [senderName]: key } = await auth.keys.get('sender-key', [senderName]);
+            return !!key;
+        },
+        async getSessionInfo(jid) {
+            var _a, _b;
+            const addr = jidToSignalProtocolAddress(jid).toString();
+            const session = await storage.loadSession(addr);
+            if (!session) {
+                return null;
+            }
+            const open = (_a = session.getOpenSession) === null || _a === void 0 ? void 0 : _a.call(session);
+            const baseKey = open === null || open === void 0 ? void 0 : ((_b = open.indexInfo) === null || _b === void 0 ? void 0 : _b.baseKey);
+            const registrationId = open === null || open === void 0 ? void 0 : open.registrationId;
+            if (!baseKey || typeof registrationId !== 'number') {
+                return null;
+            }
+            return { baseKey: new Uint8Array(baseKey), registrationId };
+        },
+        async injectE2ESession({ jid, session }) {
+            const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid));
+            await cipher.initOutgoing(session);
+        },
+        jidToSignalProtocolAddress(jid) {
+            return jidToSignalProtocolAddress(jid).toString();
+        },
+        getLidAddress(jid) {
+            return jidToSignalProtocolAddress(jid).toString();
+        },
+        getDeviceCanHandleLid() {
+            return true;
+        },
+        lidMapping: {
+            async get(jid) {
+                const { [jid]: mapping } = await auth.keys.get('lid-mapping', [jid]);
+                return mapping || undefined;
+            },
+            async set(lid, pn) {
+                await auth.keys.set({ 'lid-mapping': { [lid]: pn, [pn]: lid } });
+            },
+            async getLIDForPN(pnJid) {
+                // Try to get a LID mapping for this PN JID
+                const { [pnJid]: mapping } = await auth.keys.get('lid-mapping', [pnJid]);
+                if (mapping && typeof mapping === 'string' && mapping.includes('@lid')) {
+                    return mapping;
+                }
+                return undefined;
+            }
+        },
+        async migrateSession(fromJids, toLid) {
+            // Session migration: copy sessions from PN JIDs to LID JID
+            let migrated = 0;
+            const lidDecoded = (0, WABinary_1.jidDecode)(toLid);
+            const candidates = [];
+            for (const fromJid of fromJids) {
+                try {
+                    const fromAddr = jidToSignalProtocolAddress(fromJid).toString();
+                    // Determine the target LID address with matching device
+                    const decoded = (0, WABinary_1.jidDecode)(fromJid);
+                    const device = decoded?.device || 0;
+                    const targetJid = (0, WABinary_1.jidEncode)(lidDecoded?.user, 'lid', device);
+                    const toAddr = jidToSignalProtocolAddress(targetJid).toString();
+                    candidates.push({ fromAddr, toAddr });
+                } catch (err) {
+                    // Silently skip individual migration failures
+                }
+            }
+            if (candidates.length) {
+                const fromSessions = await auth.keys.get('session', candidates.map(c => c.fromAddr));
+                const targetSessions = await auth.keys.get('session', candidates.map(c => c.toAddr));
+                const updates = {};
+                for (const { fromAddr, toAddr } of candidates) {
+                    const existingSession = fromSessions[fromAddr];
+                    if (existingSession) {
+                        // Only migrate if target doesn't already have a session
+                        const targetSession = targetSessions[toAddr] || updates[toAddr];
+                        if (!targetSession) {
+                            updates[toAddr] = existingSession;
+                            migrated++;
+                        }
+                    }
+                }
+                if (migrated) {
+                    await auth.keys.set({ 'session': updates });
+                }
+            }
+            return { migrated };
+        },
+        async deleteSession(jids) {
+            const updates = {};
+            for (const jid of jids) {
+                const addr = jidToSignalProtocolAddress(jid).toString();
+                updates[addr] = null;
+            }
+            await auth.keys.set({ 'session': updates });
+        }
+    };
+}
+const jidToSignalProtocolAddress = (jid) => {
+    const { user, device } = (0, WABinary_1.jidDecode)(jid);
+    return new libsignal.ProtocolAddress(user, device || 0);
+};
+const jidToSignalSenderKeyName = (group, user) => {
+    return new sender_key_name_1.SenderKeyName(group, jidToSignalProtocolAddress(user));
+};
+function signalStorage({ creds, keys }) {
+    return {
+        loadSession: async (id) => {
+            const { [id]: sess } = await keys.get('session', [id]);
+            if (sess) {
+                return libsignal.SessionRecord.deserialize(sess);
+            }
+        },
+        storeSession: async (id, session) => {
+            await keys.set({ session: { [id]: session.serialize() } });
+        },
+        isTrustedIdentity: () => {
+            return true;
+        },
+        loadPreKey: async (id) => {
+            const keyId = id.toString();
+            const { [keyId]: key } = await keys.get('pre-key', [keyId]);
+            if (key) {
+                return {
+                    privKey: Buffer.from(key.private),
+                    pubKey: Buffer.from(key.public)
+                };
+            }
+        },
+        removePreKey: (id) => keys.set({ 'pre-key': { [id]: null } }),
+        loadSignedPreKey: () => {
+            const key = creds.signedPreKey;
+            return {
+                privKey: Buffer.from(key.keyPair.private),
+                pubKey: Buffer.from(key.keyPair.public)
+            };
+        },
+        loadSenderKey: async (senderKeyName) => {
+            const keyId = senderKeyName.toString();
+            const { [keyId]: key } = await keys.get('sender-key', [keyId]);
+            if (key) {
+                return sender_key_record_1.SenderKeyRecord.deserialize(key);
+            }
+            return new sender_key_record_1.SenderKeyRecord();
+        },
+        storeSenderKey: async (senderKeyName, key) => {
+            const keyId = senderKeyName.toString();
+            const serialized = JSON.stringify(key.serialize());
+            await keys.set({ 'sender-key': { [keyId]: Buffer.from(serialized, 'utf-8') } });
+        },
+        getOurRegistrationId: () => creds.registrationId,
+        getOurIdentity: () => {
+            const { signedIdentityKey } = creds;
+            return {
+                privKey: Buffer.from(signedIdentityKey.private),
+                pubKey: (0, Utils_1.generateSignalPubKey)(signedIdentityKey.public)
+            };
+        }
+    };
+}

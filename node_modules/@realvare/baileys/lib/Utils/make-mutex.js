@@ -1,0 +1,49 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.makeKeyedMutex = exports.makeMutex = void 0;
+const makeMutex = () => {
+    let task = Promise.resolve();
+    let taskTimeout;
+    const MUTEX_TIMEOUT_MS = 30000;
+    return {
+        mutex(code) {
+            task = (async () => {
+                // wait for the previous task to complete
+                // if there is an error, we swallow so as to not block the queue
+                try {
+                    await task;
+                }
+                catch (_a) { }
+                try {
+                    // execute the current task with a safety timeout to prevent deadlocks
+                    const result = await Promise.race([
+                        code(),
+                        new Promise((_, reject) => {
+                            taskTimeout = setTimeout(() => reject(new Error('Mutex task timeout after ' + MUTEX_TIMEOUT_MS + 'ms')), MUTEX_TIMEOUT_MS);
+                        })
+                    ]);
+                    return result;
+                }
+                finally {
+                    clearTimeout(taskTimeout);
+                }
+            })();
+            // we replace the existing task, appending the new piece of execution to it
+            // so the next task will have to wait for this one to finish
+            return task;
+        },
+    };
+};
+exports.makeMutex = makeMutex;
+const makeKeyedMutex = () => {
+    const map = {};
+    return {
+        mutex(key, task) {
+            if (!map[key]) {
+                map[key] = (0, exports.makeMutex)();
+            }
+            return map[key].mutex(task);
+        }
+    };
+};
+exports.makeKeyedMutex = makeKeyedMutex;

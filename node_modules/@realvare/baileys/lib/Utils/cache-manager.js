@@ -1,0 +1,134 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CacheManager = exports.default = void 0;
+const NodeCache = require('node-cache');
+const v8 = require('v8');
+const { getPerformanceConfig } = require('./performance-config');
+
+class CacheManager {
+    constructor() {
+        const config = getPerformanceConfig();
+        this.caches = {};
+        this.memoryCheckInterval = null;
+        this.msgStore = null;
+        Object.entries(config.cache).forEach(([name, options]) => {
+            this.caches[name] = new NodeCache({
+                stdTTL: options.ttl / 1000,
+                checkperiod: Math.min(options.cleanupInterval / 1000, 60),
+                maxKeys: options.maxSize,
+                useClones: false
+            });
+        });
+
+        if (config.performance.enableMetrics) {
+            this.startMemoryMonitoring(config.performance.memoryThreshold);
+        }
+    }
+    setMessageStore(msgStore) {
+        this.msgStore = msgStore;
+    }
+
+    startMemoryMonitoring(threshold) {
+        this.memoryCheckInterval = setInterval(() => {
+            const memoryUsage = process.memoryUsage();
+            const used = memoryUsage.heapUsed;
+            const rss = memoryUsage.rss;
+
+            let heapLimit;
+            try {
+                heapLimit = v8.getHeapStatistics().heap_size_limit;
+            } catch (e) {
+                heapLimit = memoryUsage.heapTotal;
+            }
+            const ratio = used / heapLimit;
+            if ((ratio > threshold && used > 500 * 1024 * 1024) || rss > 1.5 * 1024 * 1024 * 1024) {
+                this.evictLeastUsed();
+                if (global && global.gc) {
+                    global.gc();
+                }
+            }
+        }, 30000);
+    }
+
+    evictLeastUsed() {
+        const PROTECTED_PATTERNS = ['signal', 'session', 'prekey', 'senderkey', 'identity'];
+        Object.entries(this.caches).forEach(([name, cache]) => {
+            const nameLower = name.toLowerCase();
+            if (PROTECTED_PATTERNS.some(p => nameLower.includes(p))) return;
+            const stats = cache.getStats();
+            if (stats.keys > 20) {
+                const keys = cache.keys();
+                const toRemove = Math.floor(keys.length * 0.5);
+                keys.slice(0, toRemove).forEach(key => cache.del(key));
+            }
+        });
+
+        if (this.msgStore) {
+            try {
+                for (const jid in this.msgStore.messages) {
+                    const list = this.msgStore.messages[jid];
+                    if (list && list.array && list.array.length > 10) {
+                        list.array.splice(0, list.array.length - 10);
+                    }
+                }
+            } catch (e) {
+                console.error('[CacheManager] Error during store cleanup:', e);
+            }
+        }
+    }
+
+    get(cacheName, key) {
+        return this.caches[cacheName]?.get(key);
+    }
+
+    set(cacheName, key, value, ttl = undefined) {
+        const ttlSeconds = typeof ttl === 'number' ? ttl / 1000 : ttl;
+        return this.caches[cacheName]?.set(key, value, ttlSeconds);
+    }
+
+    async setAsync(cacheName, key, fetchData, ttl = undefined) {
+        try {
+            const value = await fetchData();
+            return this.set(cacheName, key, value, ttl);
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    del(cacheName, key) {
+        return this.caches[cacheName]?.del(key);
+    }
+
+    getStats(cacheName) {
+        if (!this.caches || !this.caches[cacheName]) {
+            return undefined;
+        }
+        try {
+            return this.caches[cacheName].getStats();
+        } catch (error) {
+            return undefined;
+        }
+    }
+
+    on(event, callback) {
+        if (event === 'bad_ack') {
+            this.badAckCallback = callback;
+        }
+    }
+    cleanupBadAck(key) {
+        if (this.badAckCallback) {
+            this.badAckCallback(key);
+        }
+    }
+
+    shutdown() {
+        if (this.memoryCheckInterval) {
+            clearInterval(this.memoryCheckInterval);
+        }
+        Object.values(this.caches).forEach(cache => cache.close());
+    }
+}
+
+const cacheManager = new CacheManager();
+exports.default = cacheManager;
+exports.CacheManager = cacheManager;

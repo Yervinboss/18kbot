@@ -1,0 +1,26 @@
+{
+  "120363428251793571@g.us": {
+    "status": false,
+    "mode": "delete"
+  },
+  "120363428149240057@g.us": {
+    "enabled": true,
+    "mode": "warn"
+  },
+  "120363426647057206@g.us": {
+    "enabled": true,
+    "mode": "kick"
+  },
+  "120363413369029588@g.us": {
+    "enabled": true,
+    "mode": "kick"
+  },
+  "120363427550529232@g.us": {
+    "enabled": true,
+    "mode": "kick"
+  },
+  "120363430248448156@g.us": {
+    "enabled": true,
+    "mode": "kick"
+  }
+}
