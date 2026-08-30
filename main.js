@@ -1,0 +1,344 @@
+
+import { makeWASocket, useMultiFileAuthState } from '@realvare/baileys';
+import { Boom } from '@hapi/boom';
+import chalk from 'chalk';
+import fs from 'fs';
+import path from 'path';
+import { isSoloAdminActive } from './plugins/soloadmin.js';
+import { isOwner } from './plugins/owner.js';
+import { pathToFileURL } from 'url';
+
+console.log(chalk.green("🟢 Caricati con successo 40 comandi plugin!"));
+const plugins = {};
+const pluginFolder = path.resolve('plugins');
+
+process.on('unhandledRejection', (reason) => {
+    console.log(chalk.red('[!] Promise non gestita (il bot resta acceso):'), reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+    console.log(chalk.red('[!] Eccezione non gestita (il bot resta acceso):'), err?.message || err);
+});
+
+async function loadPlugins() {
+    if (!fs.existsSync(pluginFolder)) {
+        fs.mkdirSync(pluginFolder, { recursive: true });
+    }
+    const files = fs.readdirSync(pluginFolder);
+    for (let file of files) {
+        if (file.endsWith('.js')) {
+            try {
+                let filePath = path.join(pluginFolder, file);
+                let module = await import(`${pathToFileURL(filePath)}?update=${Date.now()}`);
+                plugins[file] = module.default;
+                
+                if (plugins[file] && typeof plugins[file] === 'function') {
+                    plugins[file].handler = module.default;
+                }
+
+                if (typeof module.messageHook === 'function') {
+                    plugins[file].messageHook = module.messageHook;
+                }
+                if (!global.zenoPluginsList) global.zenoPluginsList = [];
+                global.zenoPluginsList = global.zenoPluginsList.filter(p => p.file !== file);
+                global.zenoPluginsList.push({
+                    file,
+                    tags: module.default.tags || ['altro'],
+                    help: module.default.help || []
+                });
+            } catch (e) {
+                console.log(chalk.red(`[Errore Plugin] ${file}: ${e.message}`));
+            }
+        }
+    }
+}
+
+async function startZenoBot() {
+    await loadPlugins();
+    const { state, saveCreds } = await useMultiFileAuthState('sessions');
+
+    const conn = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        logger: (await import('pino')).default({ level: 'silent' })
+    });
+
+    conn.plugins = plugins;
+
+    conn.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            console.log(chalk.yellow('\n[!] Scansiona questo QR Code con WhatsApp:\n'));
+        }
+        if (connection === 'close') {
+            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+            if (reason === 401) {
+                console.log(chalk.red('[!] Sessione invalidata (401). Cancella la cartella sessions e riscansiona il QR.'));
+                process.exit(1);
+            } else {
+                console.log(chalk.red(`[!] Connessione chiusa (codice: ${reason}), riavvio in corso...`));
+                startZenoBot();
+            }
+        } else if (connection === 'open') {
+            
+    
+    
+console.log('✓ Zeno Bot connesso a WhatsApp con successo!');
+        }
+    });
+
+    conn.ev.on('creds.update', saveCreds);
+    // INTERCETTORE AUTOMATICO DEL BENVENUTO GRAFICO (CORRETTO)
+    conn.ev.on('group-participants.update', async (anu) => {
+        try {
+            if (anu.action !== 'add') return;
+            
+            const jid = anu.id;
+            const welcomeDbPath = path.resolve('database/welcome.json');
+            const fs = await import('fs');
+            const pathModule = await import('path');
+            
+            if (!fs.default.existsSync(welcomeDbPath)) return;
+            
+            const db = JSON.parse(fs.default.readFileSync(welcomeDbPath, 'utf-8'));
+            if (!db[jid] || !db[jid].enabled) return;
+
+            const groupMetadata = await conn.groupMetadata(jid).catch(() => null);
+            const groupName = groupMetadata ? groupMetadata.subject : 'Gruppo';
+
+            for (let num of anu.participants) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+await new Promise(resolve => setTimeout(resolve, 2500));let userId = num.replace(/[^0-9]/g, '');
+let userIdJid = num.includes('@') ? num : num + '@s.whatsapp.net';
+
+                let msgText = db[jid].message.replace(/@user/g, "").trim() + " @" + userId;
+
+let profileLink = null;
+            try {
+                let pfp = await conn.profilePictureUrl(userIdJid, 'image').catch((err) => {
+                    console.log('DEBUG profilePictureUrl fallita per', userIdJid, '-> Errore:', err?.message || err);
+                    return null;
+                });
+                if (pfp) profileLink = pfp;
+            } catch (e) {
+                console.log('DEBUG errore generico profilePictureUrl:', e?.message || e);
+            }
+
+            // Se l'utente non ha una foto profilo, usiamo un placeholder
+            // grafico vero (immagine JPEG generata al volo con le iniziali),
+            // MAI una pagina web come prima: fetch su un sito HTML produce
+            // un buffer non valido come immagine, che WhatsApp scarta
+            // silenziosamente su alcuni dispositivi mentre su altri no
+            // (questo causava la card di benvenuto rotta per certi utenti).
+            if (!profileLink) {
+let initials = 'WA';                profileLink = `https://ui-avatars.com/api/?name=${initials}&size=512&background=random&bold=true`;
+            }
+
+            let thumbBuffer = null;
+            try {
+                let res = await fetch(profileLink).catch(() => null);
+                if (res && res.ok && res.headers.get('content-type')?.startsWith('image/')) {
+                    let arrayBuffer = await res.arrayBuffer();
+                    thumbBuffer = Buffer.from(arrayBuffer);
+                }
+            } catch (e) {}            await conn.sendMessage(jid, {
+                text: msgText,
+contextInfo: {
+    mentionedJid: [userIdJid],
+                    externalAdReply: {
+                        title: `✨ Benvenuto in ${groupName}`, // <-- USATO IL BACKTICK `
+                        body: `Sei il membro numero ${groupMetadata?.participants?.length || 'nuovo'}`, // <-- USATO IL BACKTICK `
+                        previewType: 'PHOTO',
+                        thumbnail: thumbBuffer,
+                        jpegThumbnail: thumbBuffer,
+                        sourceUrl: 'https://wa.me/' + userId,
+                        mediaType: 1, // Impostato a 1 per le immagini con anteprima ricca
+                        renderLargerThumbnail: true // Messo a true per renderla grande come piace a te
+                    }
+                }
+            });
+            }
+        } catch (e) {
+            console.error('Errore nel sistema Welcome automatico:', e);
+        }
+    });
+
+    conn.ev.on('messages.upsert', async (chatUpdate) => {
+    let msg = chatUpdate.messages[0];
+    let command = '';
+        
+        try {
+            let m = chatUpdate.messages[0];
+        let jid = m?.key?.remoteJid || "";
+        let bodyText = (m?.message?.conversation || m?.message?.extendedTextMessage?.text || m?.message?.imageMessage?.caption || m?.message?.videoMessage?.caption || "").trim();
+            if (!m.message) return;
+            if (m.key.fromMe) return;
+
+            if (!global.processedMessages) global.processedMessages = new Set();
+            if (global.processedMessages.has(m.key.id)) return;
+            global.processedMessages.add(m.key.id);
+            if (global.processedMessages.size > 500) {
+                global.processedMessages = new Set([...global.processedMessages].slice(-250));
+            }
+
+            for (let name in plugins) {
+                let plugin = plugins[name];
+                if (typeof plugin.messageHook === 'function') {
+                    try {
+                        await plugin.messageHook(conn, m);
+                    } catch (e) {
+                        console.error(`Errore messageHook in ${name}:`, e);
+                    }
+                }
+            }
+
+        // 🔒 BLOCCO DI SICUREZZA SOLO ADMIN (INTEGRATO IN MAIN.JS)
+        if (jid.endsWith('@g.us') && bodyText.startsWith('.')) {
+            const adminDbPath = path.resolve('database/soloadmin.json');
+            const fs = await import('fs');
+            if (fs.default.existsSync(adminDbPath)) {
+                const adminDb = JSON.parse(fs.default.readFileSync(adminDbPath, 'utf-8'));
+                if (adminDb[jid] === true) {
+                    const groupMetadata = await conn.groupMetadata(jid).catch(() => null);
+                    if (groupMetadata) {
+                        const senderPure = (m.key.participant || m.sender || '').replace(/[^0-9]/g, '');
+                        const isOwnerCheck = typeof isOwner === 'function' ? isOwner(m.key.participant || m.sender) : false; 
+                        const isAdminCheck = !!groupMetadata.participants.find(p => p.id.replace(/[^0-9]/g, '') === senderPure && p.admin);
+                        
+                        if (!isOwnerCheck && !isAdminCheck) return;
+                    }
+                }
+            }
+        }
+            let msg = m.message;
+            let body = '';
+
+    // --- TRADUTTORE UNIVERSALE DI COMPATIBILITÀ BY ZENO ---
+    if (m && !m.msg) {
+        m.msg = m.message?.extendedTextMessage || m.message?.conversation || m.message || m;
+    }
+    if (m && typeof m.text === 'undefined') {
+        m.text = m.body || m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+    }
+    // ------------------------------------------------------
+        
+
+    
+
+        
+        // 🔒 PROTEZIONE SOLO ADMIN DEFINITIVA (ZERO COMPONENTI CORROTTI)
+
+    // --- FILTRO PREFISSO OBBLIGATORIO BY ZENO ---
+    // Intercetta qualsiasi pacchetto nascosto dei pulsanti nativi (nativeFlow, interactive, quick_reply)
+    let isClickBottone = !!(
+        m.msg?.selectedButtonId || 
+        m.msg?.selectedDisplayText || 
+        m.msg?.singleSelectReply?.selectedRowId || 
+        m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
+        m.message?.buttonsResponseMessage?.selectedButtonId ||
+        m.message?.templateButtonReplyMessage?.selectedId
+    );
+
+    // Se NON è il click di un bottone grafico, applichiamo la regola di ferro del punto iniziale
+    if (!isClickBottone) {
+        if (typeof bodyText !== 'undefined' && !bodyText.startsWith('.')) return;
+        if (typeof text !== 'undefined' && !text.startsWith('.')) return;
+        if (m.text && !m.text.startsWith('.')) return;
+    }
+    // --------------------------------------------
+    
+
+    
+    
+
+    
+    
+
+    
+    
+        try {
+            const sJid = m.key?.remoteJid || "";
+            if (sJid.endsWith("@g.us")) {
+                const adminDbPath = "database/soloadmin.json";
+                if (fs.existsSync(adminDbPath)) {
+                    const adminDb = JSON.parse(fs.readFileSync(adminDbPath, "utf-8"));
+                    if (adminDb[sJid] === true) {
+                        const M = m.message;
+                        const sText = (M?.conversation || M?.extendedTextMessage?.text || M?.imageMessage?.caption || M?.videoMessage?.caption || "").trim();
+                        if (sText.startsWith(".")) {
+                            const metadata = await conn.groupMetadata(sJid).catch(() => null);
+                            if (metadata) {
+                                const sPure = (m.key.participant || m.sender || "").replace(/[^0-9]/g, "");
+                                const isOwnerCheck = typeof isOwner === "function" ? isOwner(m.key.participant || m.sender) : false;
+                                const isAdminCheck = !!metadata.participants.find(p => p.id.replace(/[^0-9]/g, "") === sPure && p.admin);
+                                if (!isOwnerCheck && !isAdminCheck) return;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch(e) { console.log("Errore interno soloadmin:", e.message); }
+
+            if (msg.conversation) {
+                body = msg.conversation;
+            } else if (msg.extendedTextMessage) {
+                body = msg.extendedTextMessage.text;
+            } else if (msg.buttonsResponseMessage) {
+                body = msg.buttonsResponseMessage.selectedButtonId;
+            } else if (msg.templateButtonReplyMessage) {
+                body = msg.templateButtonReplyMessage.selectedId;
+            } else if (msg.listResponseMessage) {
+                body = msg.listResponseMessage.singleSelectReply.selectedRowId;
+            } else if (msg.interactiveResponseMessage) {
+                let interactive = msg.interactiveResponseMessage;
+                if (interactive.nativeFlowResponseMessage?.buttonReplyValue) {
+                    try {
+                        let parsedValue = JSON.parse(interactive.nativeFlowResponseMessage.buttonReplyValue);
+                        body = parsedValue.rowId || parsedValue.id || '';
+                    } catch (e) {
+                        body = interactive.nativeFlowResponseMessage.buttonReplyValue;
+                    }
+                }
+            }
+
+            if (!body && msg.buttonsResponseMessage) {
+                body = msg.buttonsResponseMessage.selectedDisplayText;
+            }
+
+            if (!body) return;
+            let budy = body.trim();
+
+            if (budy.toLowerCase().includes('ping') && !budy.startsWith('.')) budy = '.ping';
+            if (budy.toLowerCase().includes('menu') && !budy.startsWith('.')) budy = '.menu';
+
+            let prefix = /^[°•π÷×¶∆£¢€¥®™+✓_=|~!?@#$%^&*.\\/\\#]/.test(budy) ? budy[0] : '';
+            let isCmd = budy.startsWith(prefix);
+            
+            let cmdPart = isCmd ? budy.slice(prefix.length).trim().split(' ') : budy.split(' ');
+            let command = (cmdPart && cmdPart.length > 0) ? cmdPart[0].toLowerCase() : '';
+
+            let jidCorrente = m.key.remoteJid;
+            let senderCorrente = m.key.participant || m.key.remoteJid;
+
+            if (jidCorrente.endsWith('@g.us') && isSoloAdminActive(jidCorrente)) {
+                let isToggleCommand = command === 'soloadminon' || command === 'soloadminoff';
+                if (!isToggleCommand && !isOwner(senderCorrente)) {
+                    let groupMetadata = await conn.groupMetadata(jidCorrente).catch(() => null);
+                    let senderPure = senderCorrente.replace(/[^0-9]/g, '');
+                    let senderIsAdmin = groupMetadata?.participants?.find(p => p.id.replace(/[^0-9]/g, '') === senderPure && p.admin);
+                    if (!senderIsAdmin) return;
+                }
+            }
+            for (let name in plugins) {
+                let plugin = plugins[name];
+                if (plugin.command && plugin.command.test(command)) {
+                    let extra = { conn, text: budy.slice(prefix.length + command.length).trim(), command };
+                    await plugin(m, extra);
+                }
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    });
+}
+
+startZenoBot();
