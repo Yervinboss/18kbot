@@ -14,6 +14,7 @@ const __dirname = path.dirname(__filename);
 
 const configPath = path.resolve('database/shazam.json');
 const shazamMusicDbPath = path.join(__dirname, 'shazam_music_db.json');
+const playlistDbPath = path.join(__dirname, '../playlist_db.json'); // Percorso al DB della playlist
 
 const makeMessageID = () => 'ZENO' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
@@ -38,24 +39,28 @@ function writeMusicDB(data) {
     fs.writeFileSync(shazamMusicDbPath, JSON.stringify(data, null, 2), 'utf-8');
 }
 
-async function downloadMedia(mediaMessage, type) {
-    let stream = await downloadContentFromMessage(mediaMessage, type);
-    let buffer = Buffer.from([]);
-    for await (let chunk of stream) {
-        buffer = Buffer.concat([buffer, chunk]);
-    }
-    return buffer;
+// Funzione helper per leggere/scrivere la playlist da shazam
+function readPlaylistDB() {
+    if (!fs.existsSync(playlistDbPath)) return {};
+    try { return JSON.parse(fs.readFileSync(playlistDbPath, 'utf-8')); } catch (e) { return {}; }
 }
 
-async function sendWithButton(conn, jid, text, displayText, buttonId) {
+function writePlaylistDB(data) {
+    try { fs.writeFileSync(playlistDbPath, JSON.stringify(data, null, 2), 'utf-8'); } catch (e) {}
+}
+
+async function sendWithTwoButtons(conn, jid, text) {
     let payload = {
         viewOnceMessage: {
             message: {
                 interactiveMessage: {
                     body: { text },
-                    footer: { text: 'Zeno Bot - Shazam' },
+                    footer: { text: 'Zeno Bot - Shazam & Playlist' },
                     nativeFlowMessage: {
-                        buttons: [{ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: displayText, id: buttonId }) }]
+                        buttons: [
+                            { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: '🎵 Riproduci', id: 'shazam_play' }) },
+                            { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: '➕ Aggiungi a PL', id: 'shazam_add_pl' }) }
+                        ]
                     }
                 }
             }
@@ -66,6 +71,7 @@ async function sendWithButton(conn, jid, text, displayText, buttonId) {
 
 let handler = async (m, { conn, text, command }) => {
     let jid = m.key.remoteJid;
+    let sender = m.key.participant || m.participant || jid;
     let cmd = (command || '').toLowerCase();
 
     let buttonId = 
@@ -73,18 +79,24 @@ let handler = async (m, { conn, text, command }) => {
         m.message?.templateButtonReplyMessage?.selectedId ||
         m.msg?.selectedButtonId;
 
+    if (!buttonId && m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+        try {
+            let jsonReply = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
+            buttonId = jsonReply.id || jsonReply.rowId || '';
+        } catch (e) {}
+    }
+
     if (buttonId) {
         cmd = buttonId.trim().toLowerCase();
     }
 
     if (cmd === 'setshazamkey') {
-        let sender = m.key.participant || m.key.remoteJid;
         if (!isOwner(sender)) {
             return await conn.sendMessage(jid, { text: '❌ Solo il creatore del bot può impostare la chiave API.' }, { quoted: m });
         }
         let key = (text || '').trim();
         if (!key) {
-            return await conn.sendMessage(jid, { text: '❌ Scrivi la chiave API dopo il comando.\nEsempio: `.setshazamkey abc123...`\n\nOttieni una chiave gratuita su https://audd.io' }, { quoted: m });
+            return await conn.sendMessage(jid, { text: '❌ Scrivi la chiave API dopo il comando.\nEsempio: `.setshazamkey abc123...`' }, { quoted: m });
         }
         let config = getConfig();
         config.apiKey = key;
@@ -92,9 +104,42 @@ let handler = async (m, { conn, text, command }) => {
         return await conn.sendMessage(jid, { text: '✅ Chiave API di riconoscimento musicale impostata correttamente!' }, { quoted: m });
     }
 
+    // Gestione del pulsante per aggiungere la traccia di Shazam direttamente alla playlist dell'utente
+    if (cmd === 'shazam_add_pl') {
+        let musicDb = readMusicDB();
+        let trackData = musicDb[jid]; // Può essere un URL stringa o un oggetto salvato in precedenza
+
+        let targetUrl = typeof trackData === 'object' ? trackData.url : trackData;
+        let targetTitle = typeof trackData === 'object' ? trackData.title : 'Brano da Shazam';
+        let targetDuration = typeof trackData === 'object' ? trackData.duration : '--:--';
+
+        if (!targetUrl) {
+            return await conn.sendMessage(jid, { text: '❌ Traccia non trovata o sessione scaduta. Fai di nuovo `.shazam`.' }, { quoted: m });
+        }
+
+        let plDb = readPlaylistDB();
+        if (!plDb[sender]) plDb[sender] = [];
+
+        // Evitiamo duplicati esatti basati sull'URL
+        let exists = plDb[sender].some(t => t.url === targetUrl);
+        if (exists) {
+            return await conn.sendMessage(jid, { text: '⚠️ Questo brano è già presente nella tua playlist (.pl)!' }, { quoted: m });
+        }
+
+        plDb[sender].push({
+            title: targetTitle,
+            url: targetUrl,
+            duration: targetDuration
+        });
+
+        writePlaylistDB(plDb);
+        return await conn.sendMessage(jid, { text: `✅ Brano aggiunto con successo alla tua playlist (.pl)!\n🎵 *${targetTitle}*` }, { quoted: m });
+    }
+
     if (cmd === 'shazam_play') {
         let musicDb = readMusicDB();
-        let videourl = musicDb[jid];
+        let trackData = musicDb[jid];
+        let videourl = typeof trackData === 'object' ? trackData.url : trackData;
 
         if (!videourl) {
             return await conn.sendMessage(jid, { text: '❌ Errore: Il link della canzone è scaduto o non trovato. Fai di nuovo `.shazam`.' }, { quoted: m });
@@ -109,7 +154,6 @@ let handler = async (m, { conn, text, command }) => {
         
         exec(yt_command, async (error, stdout, stderr) => {
             if (error) {
-                console.error('Errore yt-dlp shazam:', stderr);
                 return await conn.sendMessage(jid, { text: '❌ Errore durante il download del brano.' }, { quoted: m });
             }
 
@@ -119,7 +163,6 @@ let handler = async (m, { conn, text, command }) => {
                 if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
 
                 if (err2) {
-                    console.error('Errore conversione ffmpeg shazam:', stderr2);
                     return await conn.sendMessage(jid, { text: '❌ Errore nella conversione del vocale.' }, { quoted: m });
                 }
 
@@ -151,7 +194,7 @@ let handler = async (m, { conn, text, command }) => {
     if (cmd === 'shazam') {
         let config = getConfig();
         if (!config.apiKey) {
-            return await conn.sendMessage(jid, { text: '❌ Nessuna chiave API impostata.\nIl creatore del bot deve prima usare `.setshazamkey <chiave>`.\n\nChiave gratuita disponibile su https://audd.io' }, { quoted: m });
+            return await conn.sendMessage(jid, { text: '❌ Nessuna chiave API impostata.\nUsa `.setshazamkey <chiave>` (disponibile su https://audd.io)' }, { quoted: m });
         }
 
         let quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -173,7 +216,7 @@ let handler = async (m, { conn, text, command }) => {
         try {
             let mediaBuffer;
             if (audioMsg) {
-                mediaByffer = await downloadMedia(audioMsg, 'audio');
+                mediaBuffer = await downloadMedia(audioMsg, 'audio');
                 fs.writeFileSync(tmpIn + '.ogg', mediaBuffer);
                 await execPromise(`ffmpeg -y -i "${tmpIn}.ogg" -t 15 "${tmpMp3}"`);
             } else {
@@ -194,7 +237,7 @@ let handler = async (m, { conn, text, command }) => {
 
             if (result.status !== 'success' || !result.result) {
                 await conn.sendMessage(jid, { react: { text: '❌', key: m.key } });
-                return await conn.sendMessage(jid, { text: '❌ Non sono riuscito a riconoscere questa canzone. Prova con un estratto più chiaro/lungo.' }, { quoted: m });
+                return await conn.sendMessage(jid, { text: '❌ Non sono riuscito a riconoscere questa canzone.' }, { quoted: m });
             }
 
             let song = result.result;
@@ -202,9 +245,6 @@ let handler = async (m, { conn, text, command }) => {
             txt += `🎵 *Titolo:* ${song.title}\n`;
             txt += `🎤 *Artista:* ${song.artist}\n`;
             if (song.album) txt += `💿 *Album:* ${song.album}\n`;
-            if (song.release_date) txt += `📅 *Uscita:* ${song.release_date}\n`;
-            if (song.spotify?.external_urls?.spotify) txt += `\n🔗 Spotify: ${song.spotify.external_urls.spotify}`;
-            if (song.apple_music?.url) txt += `\n🔗 Apple Music: ${song.apple_music.url}`;
 
             await conn.sendMessage(jid, { react: { text: '🎵', key: m.key } });
 
@@ -213,7 +253,12 @@ let handler = async (m, { conn, text, command }) => {
                 let search = await yts(`${song.artist} ${song.title}`);
                 if (search?.videos?.length > 0) {
                     let musicDb = readMusicDB();
-                    musicDb[jid] = search.videos[0].url;
+                    // Salviamo un oggetto strutturato per ricavare comodamente anche titolo e durata
+                    musicDb[jid] = {
+                        url: search.videos[0].url,
+                        title: `${song.artist} - ${song.title}`,
+                        duration: search.videos[0].timestamp || '--:--'
+                    };
                     writeMusicDB(musicDb);
                     hasPlayButton = true;
                 }
@@ -222,7 +267,7 @@ let handler = async (m, { conn, text, command }) => {
             }
 
             if (hasPlayButton) {
-                return await sendWithButton(conn, jid, txt, '🎵 Riproduci canzone', 'shazam_play');
+                return await sendWithTwoButtons(conn, jid, txt);
             } else {
                 return await conn.sendMessage(jid, { text: txt }, { quoted: m });
             }
@@ -240,7 +285,7 @@ let handler = async (m, { conn, text, command }) => {
     }
 };
 
-handler.command = /^(shazam|setshazamkey|shazam_play)$/i;
+handler.command = /^(shazam|setshazamkey|shazam_play|shazam_add_pl)$/i;
 handler.help = ['shazam', 'setshazamkey'];
 handler.tags = ['fun'];
 
