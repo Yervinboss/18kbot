@@ -46,40 +46,63 @@ let handler = async (m, { conn, text }) => {
     let quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
     try {
-        // CASO 1: risposta a un messaggio (testo, sticker, immagine o video)
         if (quoted) {
-            if (quoted.conversation || quoted.extendedTextMessage) {
-                let quotedText = quoted.conversation || quoted.extendedTextMessage.text;
+            let actualQuoted = quoted.viewOnceMessage?.message || quoted.viewOnceMessageV2?.message || quoted;
+            
+            if (actualQuoted.conversation || actualQuoted.extendedTextMessage) {
+                let quotedText = actualQuoted.conversation || actualQuoted.extendedTextMessage.text;
                 return await conn.sendMessage(jid, { text: quotedText, mentions: allParticipants });
             }
 
-            if (quoted.stickerMessage) {
-                let buffer = await downloadMedia(quoted.stickerMessage, 'sticker');
-                return await conn.sendMessage(jid, { sticker: buffer, mentions: allParticipants });
-            }
-
-            if (quoted.imageMessage) {
-                let buffer = await downloadMedia(quoted.imageMessage, 'image');
-                return await conn.sendMessage(jid, {
-                    image: buffer,
-                    caption: quoted.imageMessage.caption || '',
-                    mentions: allParticipants
+            if (actualQuoted.stickerMessage) {
+                let buffer = await downloadMedia(actualQuoted.stickerMessage, 'sticker');
+                // Per gli sticker mandiamo un messaggio di testo con le menzioni e lo sticker allegato se serve, oppure lo sticker con contextInfo
+                return await conn.sendMessage(jid, { 
+                    sticker: buffer, 
+                    contextInfo: { mentionedJid: allParticipants } 
                 });
             }
 
-            if (quoted.videoMessage) {
-                let buffer = await downloadMedia(quoted.videoMessage, 'video');
+            if (actualQuoted.imageMessage) {
+                let imgMsg = actualQuoted.imageMessage;
+                let isViewOnce = imgMsg.viewOnce;
+                let buffer = await downloadMedia(imgMsg, 'image');
+                return await conn.sendMessage(jid, {
+                    image: buffer,
+                    caption: imgMsg.caption || '',
+                    viewOnce: isViewOnce,
+                    contextInfo: { mentionedJid: allParticipants }
+                });
+            }
+
+            if (actualQuoted.videoMessage) {
+                let vidMsg = actualQuoted.videoMessage;
+                let isViewOnce = vidMsg.viewOnce;
+                let buffer = await downloadMedia(vidMsg, 'video');
                 return await conn.sendMessage(jid, {
                     video: buffer,
-                    caption: quoted.videoMessage.caption || '',
-                    mentions: allParticipants
+                    caption: vidMsg.caption || '',
+                    viewOnce: isViewOnce,
+                    contextInfo: { mentionedJid: allParticipants }
+                });
+            }
+
+            if (actualQuoted.audioMessage) {
+                let audioMsg = actualQuoted.audioMessage;
+                let isViewOnce = audioMsg.viewOnce;
+                let buffer = await downloadMedia(audioMsg, 'audio');
+                return await conn.sendMessage(jid, {
+                    audio: buffer,
+                    mimetype: audioMsg.mimetype || 'audio/ogg; codecs=opus',
+                    ptt: audioMsg.ptt || false,
+                    viewOnce: isViewOnce,
+                    contextInfo: { mentionedJid: allParticipants }
                 });
             }
 
             return await conn.sendMessage(jid, { text: '❌ Tipo di messaggio non supportato per .tag.' }, { quoted: m });
         }
 
-        // CASO 2: .tag seguito da testo diretto, es. ".tag ciao a tutti"
         if (text && text.trim()) {
             return await conn.sendMessage(jid, { text: text.trim(), mentions: allParticipants });
         }
@@ -97,4 +120,3 @@ handler.help = ['tag'];
 handler.tags = ['moderazione'];
 
 export default handler;
-

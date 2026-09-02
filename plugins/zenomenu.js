@@ -19,7 +19,7 @@ let handler = async (m, { conn, text, command }) => {
         setbotpp: 'Cambia la foto profilo del bot con un immagine',
         p: 'Promuove l\'utente taggato ad Amministratore',
         d: 'Retrocede l\'Amministratore taggato a utente semplice',
-        tag: 'Tagga tutti i membri del gruppo con messaggio', 
+        tag: 'Tagga tutti i membri del gruppo con messaggio (e media/view once)', 
         kick: 'Caccia un utente dal gruppo con effetto immediato', 
         warn: 'Assegna un richiamo ufficiale (3 richiami = Kick)', 
         unwarn: 'Rimuove un richiamo ufficiale dall\'utente',
@@ -33,9 +33,13 @@ let handler = async (m, { conn, text, command }) => {
         link: 'Invia il link d\'invito ufficiale del gruppo',
         setgrouppp: 'Modifica la foto profilo del gruppo corrente',
         song: 'Scarica tracce musicali e file da YouTube', 
-        toaudio: 'Converti video in nota vocale Opus nativa', 
+        pl: 'Gestisce e riproduce la playlist musicale',
+        toaudio: 'Converti video in nota vocale Opus nativa',
+        tts: 'Converte il testo in un vocale audio pulito',
+        shazam: 'Riconosce il titolo e l\'artista di un brano musicale',
         s: 'Crea uno sticker personalizzato al volo da media', 
         gif: 'Cerca e invia GIF animate in loop',
+        ss: 'Cattura e invia lo screenshot istantaneo di un URL web',
         palla: 'Interroga l\'oracolo magico con una domanda',
         cazzo: 'Misura il pisello con verdetto random', 
         frocio: 'Calcola la percentuale reale di livello frocio',
@@ -50,7 +54,6 @@ let handler = async (m, { conn, text, command }) => {
         bj: 'Gioca a Blackjack scommettendo contro il banco',
         sposa: 'Sposa ufficialmente un utente del gruppo',
         divorzio: 'Annulla il matrimonio e divorzia dal partner',
-        voip: 'Estrai SIM virtuali gratis per ricevere codici OTP', 
         ping: 'Testa la velocità di risposta reale del bot', 
         id: 'Mostra l\'ID numerico della chat o del gruppo'
     };
@@ -58,10 +61,10 @@ let handler = async (m, { conn, text, command }) => {
     let categories = {
         creatore: ['clear', 'shutdown', 'addmoney', 'creatorilist', 'addcreatore', 'delcreatore', 'osint', 'setbotpp'],
         moderazione: ['p', 'd', 'tag', 'kick', 'warn', 'unwarn', 'aperto', 'chiuso', 'mute', 'unmute', 'antilink', 'antispam', 'req', 'link', 'setgrouppp'],
-        media: ['song', 'toaudio', 's', 'gif'],
+        media: ['song', 'pl', 'toaudio', 'tts', 'shazam', 's', 'gif', 'ss'],
         divertenti: ['palla', 'cazzo', 'frocio', 'negro', 'ban', 'sex', 'dox'],
         giochi: ['work', 'bal', 'ruba', 'slot', 'bj', 'sposa', 'divorzio'],
-        altro: ['voip', 'ping', 'id']
+        altro: [ 'ping', 'id']
     };
 
     let msgText = text || m.text || '';
@@ -93,9 +96,9 @@ let handler = async (m, { conn, text, command }) => {
     if (cleanText.includes('creatore') || cmdPuro === 'creatore') matchedCategory = 'creatore';
     else if (cleanText.includes('mod') || cleanText.includes('moderazione') || cmdPuro === 'moderazione') matchedCategory = 'moderazione';
     else if (cleanText.includes('media') || cmdPuro === 'media') matchedCategory = 'media';
-    else if (cleanText.includes('divertenti') || cleanText.includes('fun') || cmdPuro === 'divertenti') matchedCategory = 'divertenti';
-    else if (cleanText.includes('giochi') || cleanText.includes('rpg') || cmdPuro === 'giochi') matchedCategory = 'giochi';
-    else if (cleanText.includes('altro') || cleanText.includes('utility') || cmdPuro === 'altro') matchedCategory = 'altro';
+    else if (cleanText.includes('divertenti') || cmdPuro === 'fun' || cmdPuro === 'divertenti') matchedCategory = 'divertenti';
+    else if (cleanText.includes('giochi') || cmdPuro === 'rpg' || cmdPuro === 'giochi') matchedCategory = 'giochi';
+    else if (cleanText.includes('altro') || cmdPuro === 'utility' || cmdPuro === 'altro') matchedCategory = 'altro';
 
     let isHomeRequest = (cmdPuro === 'menu' || cmdPuro === 'help') && (!matchedCategory || cleanText === '.menu' || cleanText === 'menu');
 
@@ -143,3 +146,4 @@ handler.tags = ['main'];
 handler.command = /^(menu|help|creatore|moderazione|media|divertenti|giochi)$/i;
 
 export default handler;
+
