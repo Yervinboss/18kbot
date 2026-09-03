@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 
 const configPath = path.resolve('database/shazam.json');
 const shazamMusicDbPath = path.join(__dirname, 'shazam_music_db.json');
-const playlistDbPath = path.join(__dirname, '../playlist_db.json'); // Percorso al DB della playlist
+const playlistDbPath = path.join(__dirname, '../playlist_db.json');
 
 const makeMessageID = () => 'ZENO' + crypto.randomBytes(8).toString('hex').toUpperCase();
 
@@ -39,7 +39,6 @@ function writeMusicDB(data) {
     fs.writeFileSync(shazamMusicDbPath, JSON.stringify(data, null, 2), 'utf-8');
 }
 
-// Funzione helper per leggere/scrivere la playlist da shazam
 function readPlaylistDB() {
     if (!fs.existsSync(playlistDbPath)) return {};
     try { return JSON.parse(fs.readFileSync(playlistDbPath, 'utf-8')); } catch (e) { return {}; }
@@ -47,6 +46,15 @@ function readPlaylistDB() {
 
 function writePlaylistDB(data) {
     try { fs.writeFileSync(playlistDbPath, JSON.stringify(data, null, 2), 'utf-8'); } catch (e) {}
+}
+
+async function downloadMedia(message, type) {
+    let stream = await downloadContentFromMessage(message, type);
+    let buffer = Buffer.from([]);
+    for await (const chunk of stream) {
+        buffer = Buffer.concat([buffer, chunk]);
+    }
+    return buffer;
 }
 
 async function sendWithTwoButtons(conn, jid, text) {
@@ -104,10 +112,9 @@ let handler = async (m, { conn, text, command }) => {
         return await conn.sendMessage(jid, { text: '✅ Chiave API di riconoscimento musicale impostata correttamente!' }, { quoted: m });
     }
 
-    // Gestione del pulsante per aggiungere la traccia di Shazam direttamente alla playlist dell'utente
     if (cmd === 'shazam_add_pl') {
         let musicDb = readMusicDB();
-        let trackData = musicDb[jid]; // Può essere un URL stringa o un oggetto salvato in precedenza
+        let trackData = musicDb[jid];
 
         let targetUrl = typeof trackData === 'object' ? trackData.url : trackData;
         let targetTitle = typeof trackData === 'object' ? trackData.title : 'Brano da Shazam';
@@ -120,7 +127,6 @@ let handler = async (m, { conn, text, command }) => {
         let plDb = readPlaylistDB();
         if (!plDb[sender]) plDb[sender] = [];
 
-        // Evitiamo duplicati esatti basati sull'URL
         let exists = plDb[sender].some(t => t.url === targetUrl);
         if (exists) {
             return await conn.sendMessage(jid, { text: '⚠️ Questo brano è già presente nella tua playlist (.pl)!' }, { quoted: m });
@@ -133,7 +139,7 @@ let handler = async (m, { conn, text, command }) => {
         });
 
         writePlaylistDB(plDb);
-        return await conn.sendMessage(jid, { text: `✅ Brano aggiunto con successo alla tua playlist (.pl)!\n🎵 *${targetTitle}*` }, { quoted: m });
+        return await conn.sendMessage(jid, { text: `✅ Brano aggiunto con successo alla tua playlist (.pl)!\n🎵 *{targetTitle}*` }, { quoted: m });
     }
 
     if (cmd === 'shazam_play') {
@@ -253,7 +259,6 @@ let handler = async (m, { conn, text, command }) => {
                 let search = await yts(`${song.artist} ${song.title}`);
                 if (search?.videos?.length > 0) {
                     let musicDb = readMusicDB();
-                    // Salviamo un oggetto strutturato per ricavare comodamente anche titolo e durata
                     musicDb[jid] = {
                         url: search.videos[0].url,
                         title: `${song.artist} - ${song.title}`,

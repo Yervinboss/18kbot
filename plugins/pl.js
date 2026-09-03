@@ -1,86 +1,41 @@
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
-import { generateWAMessageContent } from '@realvare/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const playlistDbPath = path.join(__dirname, '../playlist_db.json');
-const plStatePath = path.join(__dirname, '../playlist_state.json');
-
-const makeMessageID = () => {
-    return 'ZENO' + crypto.randomBytes(8).toString('hex').toUpperCase();
-};
 
 const readDb = (p) => {
     if (!fs.existsSync(p)) return {};
     try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return {}; }
 };
 
-const writeDb = (p, data) => {
-    try { fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8'); } catch (e) { console.error(`[DB Error] ${e}`); }
-};
-
 let handler = async (m, { conn, text, command }) => {
-    let chatId = m.key.remoteJid;
-    let sender = m.key.participant || m.participant || chatId;
+    let jid = m.key.remoteJid;
+    
+    // Ripristiniamo la lettura pulita del mittente reale senza alterare il formato del JID
+    let sender = m.key.fromMe ? jid : (m.sender || m.key.participant || m.participant || jid);
 
-    let buttonId = '';
-    if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
-        try {
-            let jsonReply = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
-            buttonId = jsonReply.id || jsonReply.rowId || '';
-        } catch (e) {}
-    }
+    let selectedCmd = command ? `.${command}` : '';
+    if (text) selectedCmd += ` ${text}`;
+    selectedCmd = selectedCmd.trim().toLowerCase();
 
-    let action = (command || '').trim().toLowerCase();
-    if (buttonId && buttonId.startsWith('pl_')) {
-        action = buttonId.trim().toLowerCase();
-    } else if (text && text.startsWith('pl_')) {
-        action = text.trim().toLowerCase();
-    }
+    // Se l'utente ha cliccato su un brano della lista
+    if (selectedCmd.startsWith('.pl_select_') || command.startsWith('pl_select_')) {
+        let indexStr = selectedCmd.replace('.pl_select_', '').replace('pl_select_', '').trim();
+        let index = parseInt(indexStr);
 
-    if (!fs.existsSync(playlistDbPath)) {
-        return await conn.sendMessage(chatId, { text: '❌ La tua playlist (.PL) è vuota!' }, { quoted: m });
-    }
+        let plDb = readDb(playlistDbPath);
+        let userTracks = plDb[sender] || [];
+        let track = userTracks[index];
 
-    let plDb = readDb(playlistDbPath);
-    let userTracks = plDb[sender] || [];
-
-    if (userTracks.length === 0) {
-        return await conn.sendMessage(chatId, { text: '❌ La tua playlist (.PL) è vuota!' }, { quoted: m });
-    }
-
-    let stateDb = readDb(plStatePath);
-    if (stateDb[sender] === undefined) stateDb[sender] = 0;
-    let currentIndex = stateDb[sender];
-
-    if (action === 'pl_next') {
-        currentIndex = (currentIndex + 1) % userTracks.length;
-        stateDb[sender] = currentIndex;
-        writeDb(plStatePath, stateDb);
-    } else if (action === 'pl_prev') {
-        currentIndex = (currentIndex - 1 + userTracks.length) % userTracks.length;
-        stateDb[sender] = currentIndex;
-        writeDb(plStatePath, stateDb);
-    } else if (action === 'pl_del') {
-        userTracks.splice(currentIndex, 1);
-        plDb[sender] = userTracks;
-        writeDb(playlistDbPath, plDb);
-
-        if (userTracks.length === 0) {
-            return await conn.sendMessage(chatId, { text: '🗑️ Playlist svuotata con successo!' }, { quoted: m });
+        if (!track || !track.url) {
+            return await conn.sendMessage(jid, { text: '❌ Brano non trovato nella tua playlist.' }, { quoted: m });
         }
-        currentIndex = currentIndex >= userTracks.length ? userTracks.length - 1 : currentIndex;
-        stateDb[sender] = currentIndex;
-        writeDb(plStatePath, stateDb);
-    } else if (action === 'pl_play') {
-        let track = userTracks[currentIndex];
-        if (!track || !track.url) return await conn.sendMessage(chatId, { text: '❌ Traccia non valida.' }, { quoted: m });
 
-        await conn.sendMessage(chatId, { react: { text: '🎧', key: m.key } });
+        await conn.sendMessage(jid, { react: { text: '🎧', key: m.key } });
 
         let timestamp = Date.now();
         let inputMp3 = path.join(__dirname, `_temp_pl_${timestamp}.mp3`);
@@ -91,7 +46,7 @@ let handler = async (m, { conn, text, command }) => {
         exec(yt_command, async (error) => {
             if (error) {
                 if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
-                return await conn.sendMessage(chatId, { text: '❌ Errore durante il download da YouTube.' }, { quoted: m });
+                return await conn.sendMessage(jid, { text: '❌ Errore durante il download del brano.' }, { quoted: m });
             }
 
             let ffmpeg_command = `ffmpeg -y -i "${inputMp3}" -c:a libopus -b:a 64k -vbr on -compression_level 10 -ar 48000 -ac 1 -threads 0 -f ogg "${outputOgg}"`;
@@ -101,12 +56,12 @@ let handler = async (m, { conn, text, command }) => {
 
                 if (err2 || !fs.existsSync(outputOgg)) {
                     if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
-                    return await conn.sendMessage(chatId, { text: '❌ Errore durante la conversione audio.' }, { quoted: m });
+                    return await conn.sendMessage(jid, { text: '❌ Errore durante la conversione audio.' }, { quoted: m });
                 }
 
                 try {
                     let audioBuffer = fs.readFileSync(outputOgg);
-                    await conn.sendMessage(chatId, {
+                    await conn.sendMessage(jid, {
                         audio: audioBuffer,
                         mimetype: 'audio/ogg; codecs=opus',
                         ptt: true
@@ -121,97 +76,60 @@ let handler = async (m, { conn, text, command }) => {
         return;
     }
 
-    let track = userTracks[currentIndex];
-    let txt = `🎶 *ZENO MUSIC PLAYER (.PL)* 🎶\n\n` +
-              `📌 *Brano ${currentIndex + 1} di ${userTracks.length}*\n` +
-              `🎵 *Titolo:* ${track.title || 'Sconosciuto'}\n` +
-              `⏱️ *Durata:* ${track.duration || '--:--'}\n` +
-              `🔗 ${track.url}`;
+    // Legge la playlist associata al JID esatto dell'utente nel JSON
+    let plDb = readDb(playlistDbPath);
+    let userTracks = plDb[sender] || [];
 
-    let match = track.url ? track.url.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/) : null;
-    let imageUrl = match && match[1] ? `https://i.ytimg.com/vi/${match[1]}/hqdefault.jpg` : null;
+    if (userTracks.length === 0) {
+        return await conn.sendMessage(jid, { text: '❌ La tua playlist (.pl) è vuota! Aggiungi qualche brano prima.' }, { quoted: m });
+    }
 
-    let nativeFlowButtons = [
-        { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "⬅️ Indietro", id: "pl_prev" }) },
-        { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🎵 Ascolta", id: "pl_play" }) },
-        { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "➡️ Avanti", id: "pl_next" }) },
-        { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🗑️ Rimuovi", id: "pl_del" }) }
+    let rows = userTracks.map((track, idx) => ({
+        title: `${idx + 1}. ${track.title || 'Brano Sconosciuto'}`,
+        rowId: `.pl_select_${idx}`,
+        description: `Durata: ${track.duration || '--:--'}`
+    }));
+
+    let sections = [
+        {
+            title: `🎵 I tuoi brani (${userTracks.length})`,
+            rows: rows
+        }
     ];
 
-    // Costruiamo l'header con l'immagine incorporata (un solo messaggio,
-    // niente piu' foto separata prima del pannello) usando
-    // generateWAMessageContent per caricare/preparare il media come
-    // farebbe normalmente sendMessage con { image: ... }.
-    let header = { title: '', hasMediaAttachment: false };
-
-    if (imageUrl) {
-        try {
-            let response = await fetch(imageUrl);
-            let buffer = Buffer.from(await response.arrayBuffer());
-
-            let generated = await generateWAMessageContent(
-                { image: buffer },
-                { upload: conn.waUploadToServer }
-            );
-
-            if (generated?.imageMessage) {
-                header = {
-                    title: '',
-                    hasMediaAttachment: true,
-                    imageMessage: generated.imageMessage
-                };
-            }
-        } catch (e) {
-            console.error('Errore preparazione immagine header pl.js:', e.message);
-        }
-    }
-
-    let interactivePayload = {
-        viewOnceMessage: {
-            message: {
-                interactiveMessage: {
-                    header: header,
-                    body: { text: txt },
-                    footer: { text: `⚡ Zeno Bot - Playlist Interattiva` },
-                    nativeFlowMessage: {
-                        buttons: nativeFlowButtons
-                    }
-                }
-            }
-        }
+    let listMessage = {
+        text: `✨ *Zeno Bot - La tua Playlist*\n\nEcco l'elenco dei tuoi brani salvati. Tocca il pulsante qui sotto per scegliere cosa ascoltare:`,
+        footer: "Zeno Bot • Playlist Personale",
+        title: "📂 Archivio Musica",
+        buttonText: "📜 Apri Elenco Brani",
+        sections
     };
 
-    if (buttonId && m.quoted) {
-        let keyToDelete = m.quoted?.vM?.key || m.key;
-        if (m.message?.extendedTextMessage?.contextInfo?.stanzaId) {
-            keyToDelete = {
-                remoteJid: chatId,
-                id: m.message.extendedTextMessage.contextInfo.stanzaId,
-                fromMe: m.message.extendedTextMessage.contextInfo.participant === conn.user.jid,
-                participant: m.message.extendedTextMessage.contextInfo.participant
-            };
-        }
-        try { await conn.sendMessage(chatId, { delete: keyToDelete }); } catch (e) {}
-    }
-
-    await conn.relayMessage(chatId, interactivePayload, { messageId: makeMessageID() });
+    await conn.sendMessage(jid, listMessage, { quoted: m });
 };
 
-handler.command = /^(pl|pl_next|pl_prev|pl_play|pl_del)$/i;
+handler.command = /^(pl|pl_select_\d+)$/i;
 
 handler.all = async function (m, { conn }) {
     if (m.isBaileys || !m.message) return;
 
-    let buttonId = '';
-    if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+    let rowId = '';
+    if (m.message?.listResponseMessage?.singleSelectReply?.selectedRowId) {
+        rowId = m.message.listResponseMessage.singleSelectReply.selectedRowId;
+    } else if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
         try {
             let jsonReply = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
-            buttonId = jsonReply.id || jsonReply.rowId || '';
+            rowId = jsonReply.id || jsonReply.rowId || '';
         } catch (e) {}
     }
 
-    if (buttonId && buttonId.startsWith('pl_')) {
-        return await this.plugins['pl.js'].handler(m, { conn, text: buttonId, command: '' });
+    if (rowId && rowId.startsWith('.pl_select_')) {
+        let cleanCmd = rowId.replace('.', '');
+        let parts = cleanCmd.split('_');
+        
+        m.sender = m.key.fromMe ? m.key.remoteJid : (m.key.participant || m.participant || m.key.remoteJid);
+        
+        return await this.plugins['pl.js'].handler(m, { conn, text: `select_${parts[2]}`, command: 'pl' });
     }
 };
 
@@ -219,4 +137,3 @@ handler.help = ['pl'];
 handler.tags = ['downloader'];
 
 export default handler;
-
