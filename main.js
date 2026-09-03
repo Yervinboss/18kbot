@@ -157,9 +157,12 @@ async function startZenoBot() {
 
     conn.ev.on('messages.upsert', async (chatUpdate) => {
         try {
-            let m = chatUpdate.messages[0];
-            if (!m.message) return;
-            if (m.key.fromMe) return;
+let m = chatUpdate.messages[0];
+if (!m.message) return;
+if (m.key.fromMe) return;
+
+m.chat = m.key.remoteJid;
+m.sender = m.key.participant || m.key.remoteJid;
 
             if (!global.processedMessages) global.processedMessages = new Set();
             if (global.processedMessages.has(m.key.id)) return;

@@ -25,7 +25,6 @@ let handler = async (m, { conn }) => {
 
     let isAnimated = stickerMessage.isAnimated || false;
 
-    // 1. REAZIONE INIZIALE: Clessidra
     await conn.sendMessage(jid, {
         react: { text: '⏳', key: m.key }
     });
@@ -37,70 +36,48 @@ let handler = async (m, { conn }) => {
             buffer = Buffer.concat([buffer, chunk]);
         }
 
-        let tmpInput = path.resolve(`tmp_st_${Date.now()}.webp`);
-        let tmpOutput = isAnimated ? path.resolve(`tmp_vi_${Date.now()}.mp4`) : path.resolve(`tmp_ph_${Date.now()}.png`);
+        let tmpDir = path.resolve('./tmp');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+        let fileId = Date.now();
+        let tmpInput = path.join(tmpDir, `input_${fileId}.webp`);
+        let tmpOutput = path.join(tmpDir, isAnimated ? `output_${fileId}.mp4` : `output_${fileId}.png`);
+        
         fs.writeFileSync(tmpInput, buffer);
 
-        if (!isAnimated) {
-            // --- STICKER STATICO -> FOTO REALE ---
-            // Usiamo convert/magick locale impostando la decodifica forzata per evitare schermi neri
-            exec(`magick "${tmpInput}" "${tmpOutput}" || convert "${tmpInput}" "${tmpOutput}"`, async (error) => {
-                if (error) {
-                    console.error(error);
-                    // Fallback estremo se imagemagick fallisce: lo invia come file png forzato
-                    await conn.sendMessage(jid, { image: buffer, caption: '✅ Ecco la tua foto!' }, { quoted: m });
+        // Usiamo un comando ffmpeg sicuro con -ignore_loop 0 che gestisce sia statici che animati
+        let cmd = isAnimated 
+            ? `ffmpeg -y -i "${tmpInput}" -pix_fmt yuv420p -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" "${tmpOutput}"`
+            : `ffmpeg -y -i "${tmpInput}" -vframes 1 "${tmpOutput}"`;
+        
+        exec(cmd, async (error) => {
+            if (error || !fs.existsSync(tmpOutput)) {
+                console.error('Errore conversione ffmpeg:', error);
+                // Fallback estremo: invia il file webp nativo come documento o immagine
+                await conn.sendMessage(jid, { document: buffer, mimetype: 'image/webp', fileName: 'sticker.webp', caption: '⚠️ Conversione fallita, ecco il file originale.' }, { quoted: m });
+            } else {
+                let outBuffer = fs.readFileSync(tmpOutput);
+                if (isAnimated) {
+                    await conn.sendMessage(jid, { 
+                        video: outBuffer, 
+                        caption: '✅ Ecco il tuo video animato!', 
+                        gifPlayback: true 
+                    }, { quoted: m });
                 } else {
-                    let photoBuffer = fs.readFileSync(tmpOutput);
-                    await conn.sendMessage(jid, { image: photoBuffer, caption: '✅ Ecco la tua foto!' }, { quoted: m });
+                    await conn.sendMessage(jid, { image: outBuffer, caption: '✅ Ecco la tua foto!' }, { quoted: m });
                 }
-                cleanup();
-            });
-        } else {
-            // --- STICKER ANIMATO -> VIDEO REALE (NO SCHERMO NERO) ---
-            // Eseguiamo una conversione a due stadi nativa di ffmpeg che decodifica correttamente i WebP animati di WhatsApp
-            let cmd = `ffmpeg -v quiet -y -i "${tmpInput}" -vcodec libx264 -pix_fmt yuv420p -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" "${tmpOutput}"`;
-            
-            exec(cmd, async (error) => {
-                if (error) {
-                    console.error('Errore ffmpeg, tento fallback frame:', error);
-                    // Fallback se lo sticker ha frame rate variabile corrotto
-                    let cmdFallback = `ffmpeg -v quiet -y -ignore_loop 0 -i "${tmpInput}" -vcodec libx264 -pix_fmt yuv420p -movflags faststart -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2" "${tmpOutput}"`;
-                    exec(cmdFallback, async (err2) => {
-                        if (err2) {
-                            // Se tutto fallisce, lo mandiamo come documento per non perdere il file
-                            await conn.sendMessage(jid, { document: buffer, mimetype: 'video/mp4', fileName: 'video.mp4', caption: '⚠️ Riproduzione fallita, inviato come file.' }, { quoted: m });
-                        } else {
-                            await sendVideo();
-                        }
-                        cleanup();
-                    });
-                } else {
-                    await sendVideo();
-                    cleanup();
-                }
-            });
-        }
-
-        async function sendVideo() {
-            if (fs.existsSync(tmpOutput)) {
-                let videoBuffer = fs.readFileSync(tmpOutput);
-                await conn.sendMessage(jid, { 
-                    video: videoBuffer, 
-                    caption: '✅ Ecco il tuo video animato!', 
-                    gifPlayback: true 
-                }, { quoted: m });
             }
-        }
+            cleanup();
+        });
 
         function cleanup() {
-            // Rimuove i file temporanei per non riempire la memoria del telefono
             if (fs.existsSync(tmpInput)) fs.unlinkSync(tmpInput);
             if (fs.existsSync(tmpOutput)) fs.unlinkSync(tmpOutput);
             conn.sendMessage(jid, { react: { text: '✅', key: m.key } }).catch(() => {});
         }
 
     } catch (e) {
-        console.error('Errore generale:', e.message);
+        console.error('Errore generale toimg:', e.message);
         await conn.sendMessage(jid, { react: { text: '❌', key: m.key } });
     }
 };

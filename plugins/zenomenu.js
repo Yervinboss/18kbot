@@ -64,27 +64,20 @@ let handler = async (m, { conn, text, command }) => {
         media: ['song', 'pl', 'toaudio', 'tts', 'shazam', 's', 'gif', 'ss'],
         divertenti: ['palla', 'cazzo', 'frocio', 'negro', 'ban', 'sex', 'dox'],
         giochi: ['work', 'bal', 'ruba', 'slot', 'bj', 'sposa', 'divorzio'],
-        altro: [ 'ping', 'id']
+        altro: ['ping', 'id']
     };
 
     let msgText = text || m.text || '';
     let mMsg = m.message || m.msg || {};
     
-    if (mMsg.buttonsResponseMessage) {
-        msgText = mMsg.buttonsResponseMessage.selectedButtonId;
-    } else if (mMsg.templateButtonReplyMessage) {
-        msgText = mMsg.templateButtonReplyMessage.selectedId;
-    } else if (mMsg.interactiveResponseMessage) {
-        let nativeResponse = mMsg.interactiveResponseMessage.nativeFlowResponseMessage;
-        if (nativeResponse && nativeResponse.paramsJson) {
-            try {
-                let parsed = JSON.parse(nativeResponse.paramsJson);
-                msgText = parsed.id || msgText;
-            } catch (e) {}
-        }
+    if (mMsg.listResponseMessage?.singleSelectReply?.selectedRowId) {
+        msgText = mMsg.listResponseMessage.singleSelectReply.selectedRowId;
+    } else if (mMsg.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+        try {
+            let jsonReply = JSON.parse(mMsg.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
+            msgText = jsonReply.id || jsonReply.rowId || msgText;
+        } catch (e) {}
     }
-    
-    if (!msgText && m.text) msgText = m.text;
 
     let cleanText = msgText.toLowerCase().trim();
     let cmdPuro = command ? command.toLowerCase().trim() : '';
@@ -93,57 +86,95 @@ let handler = async (m, { conn, text, command }) => {
     }
 
     let matchedCategory = null;
-    if (cleanText.includes('creatore') || cmdPuro === 'creatore') matchedCategory = 'creatore';
-    else if (cleanText.includes('mod') || cleanText.includes('moderazione') || cmdPuro === 'moderazione') matchedCategory = 'moderazione';
-    else if (cleanText.includes('media') || cmdPuro === 'media') matchedCategory = 'media';
-    else if (cleanText.includes('divertenti') || cmdPuro === 'fun' || cmdPuro === 'divertenti') matchedCategory = 'divertenti';
-    else if (cleanText.includes('giochi') || cmdPuro === 'rpg' || cmdPuro === 'giochi') matchedCategory = 'giochi';
-    else if (cleanText.includes('altro') || cmdPuro === 'utility' || cmdPuro === 'altro') matchedCategory = 'altro';
+    if (cleanText.includes('cat_creatore') || cmdPuro === 'cat_creatore' || cleanText === 'creatore') matchedCategory = 'creatore';
+    else if (cleanText.includes('cat_moderazione') || cmdPuro === 'cat_moderazione' || cleanText === 'moderazione') matchedCategory = 'moderazione';
+    else if (cleanText.includes('cat_media') || cmdPuro === 'cat_media' || cleanText === 'media') matchedCategory = 'media';
+    else if (cleanText.includes('cat_divertenti') || cmdPuro === 'cat_divertenti' || cleanText === 'divertenti') matchedCategory = 'divertenti';
+    else if (cleanText.includes('cat_giochi') || cmdPuro === 'cat_giochi' || cleanText === 'giochi') matchedCategory = 'giochi';
+    else if (cleanText.includes('cat_altro') || cmdPuro === 'cat_altro' || cleanText === 'altro') matchedCategory = 'altro';
 
     let isHomeRequest = (cmdPuro === 'menu' || cmdPuro === 'help') && (!matchedCategory || cleanText === '.menu' || cleanText === 'menu');
-
-    let menuText = '';
-    let buttonsConfig = [];
 
     if (matchedCategory && !isHomeRequest) {
         let listCmds = categories[matchedCategory].map(cmd => {
             return `🔹 ${prefix}${cmd}\n  └ ${cmdDescriptions[cmd] || 'Nessuna descrizione disponibile'}\n`;
         }).join('\n');
 
-        menuText = `⚡ *MENU ${matchedCategory.toUpperCase()}* ⚡\n\n${listCmds}\n🎛️ _Usa il bottone qui sotto per tornare indietro:_`;
-        buttonsConfig = [
-            { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: '🏠 Torna alla Home', id: '.menu' }) }
-        ];
-    } else {
-        menuText = `『 ⚡ *Z E N O   B O T   M U L T I - D E V I C E* ⚡ 』\n\n👋 Ciao *${name}*!\nPannello grafico sbloccato al 100%.\n\n🟢 *Stato:* Online & Stabile\n📌 *Prefisso:* [ *${prefix}* ]\n\n🎛️ _Seleziona una categoria dal menù qui sotto:_`;
+        let categoryText = `⚡ *MENU ${matchedCategory.toUpperCase()}* ⚡\n\n${listCmds}\n🎛️ _Tocca il pulsante qui sotto per tornare alla tendina principale:_`;
         
-        buttonsConfig = [
-            { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "👑 Creatore", id: ".menu creatore" }) },
-            { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🛡️ Moderazione", id: ".menu moderazione" }) },
-            { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🎯 Divertenti", id: ".menu divertenti" }) },
-            { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🎵 Media", id: ".menu media" }) },
-            { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text: "🎮 Giochi", id: ".menu giochi" }) }
-        ];
-    }
-
-    let messageContent = {
-        viewOnceMessage: {
-            message: {
-                interactiveMessage: {
-                    body: { text: menuText },
-                    footer: { text: `⚙️ Powered by Zeno` },
-                    nativeFlowMessage: { buttons: buttonsConfig }
+        // Inviamo la lista dei comandi con un pulsante rapido per tornare alla home
+        let interactiveMessage = {
+            viewOnceMessage: {
+                message: {
+                    interactiveMessage: {
+                        body: { text: categoryText },
+                        footer: { text: `Zeno Bot • Categoria ${matchedCategory}` },
+                        nativeFlowMessage: {
+                            buttons: [
+                                { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: '🏠 Torna alla Home', id: '.menu' }) }
+                            ]
+                        }
+                    }
                 }
             }
-        }
-    };
+        };
 
-    return await conn.relayMessage(chat, messageContent, { quoted: m }).catch(e => console.error(e));
+        return await conn.relayMessage(chat, interactiveMessage, { quoted: m }).catch(async () => {
+            return await conn.sendMessage(chat, { text: categoryText }, { quoted: m });
+        });
+    } else {
+        let sections = [
+            {
+                title: "📂 Categorie del Bot",
+                rows: [
+                    { title: "👑 Creatore", rowId: ".menu cat_creatore", description: "Comandi di gestione avanzata e proprietà" },
+                    { title: "🛡️ Moderazione", rowId: ".menu cat_moderazione", description: "Gestione gruppi, kick, mute e sicurezza" },
+                    { title: "🎵 Media", rowId: ".menu cat_media", description: "Download, audio, sticker e strumenti web" },
+                    { title: "🎯 Divertenti", rowId: ".menu cat_divertenti", description: "Comandi fun, meme e cazzeggio" },
+                    { title: "🎮 Giochi", rowId: ".menu cat_giochi", description: "Economia RPG, scommesse e casinò" },
+                    { title: "⚙️ Altro", rowId: ".menu cat_altro", description: "Ping, ID e informazioni generali" }
+                ]
+            }
+        ];
+
+        let listMessage = {
+            text: `『 ⚡ *Z E N O   B O T   M U L T I - D E V I C E* ⚡ 』\n\n👋 Ciao *${name}*!\nPannello di controllo attivo.\n\n🟢 *Stato:* Online & Stabile\n📌 *Prefisso:* [ *${prefix}* ]\n\n🎛️ _Tocca il pulsante qui sotto per aprire il menu a tendina:_`,
+            footer: "Zeno Bot • Pannello Principale",
+            title: "📜 Seleziona Categoria",
+            buttonText: "📜 Apri Menu Categorie",
+            sections
+        };
+
+        return await conn.sendMessage(chat, listMessage, { quoted: m });
+    }
 };
 
 handler.help = ['menu'];
 handler.tags = ['main'];
-handler.command = /^(menu|help|creatore|moderazione|media|divertenti|giochi)$/i;
+handler.command = /^(menu|help|cat_creatore|cat_moderazione|cat_media|cat_divertenti|cat_giochi|cat_altro)$/i;
+
+handler.all = async function (m, { conn }) {
+    if (m.isBaileys || !m.message) return;
+
+    let rowId = '';
+    if (m.message?.listResponseMessage?.singleSelectReply?.selectedRowId) {
+        rowId = m.message.listResponseMessage.singleSelectReply.selectedRowId;
+    } else if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+        try {
+            let jsonReply = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
+            rowId = jsonReply.id || jsonReply.rowId || '';
+        } catch (e) {}
+    }
+
+    if (rowId && rowId.startsWith('.menu')) {
+        let cleanCmd = rowId.replace('.', '');
+        let parts = cleanCmd.split(' ');
+        let arg = parts.slice(1).join(' ');
+        
+        m.sender = m.key.fromMe ? m.key.remoteJid : (m.key.participant || m.participant || m.key.remoteJid);
+        
+        return await this.plugins['menu.js'].handler(m, { conn, text: arg, command: 'menu' });
+    }
+};
 
 export default handler;
-
