@@ -157,12 +157,12 @@ async function startZenoBot() {
 
     conn.ev.on('messages.upsert', async (chatUpdate) => {
         try {
-let m = chatUpdate.messages[0];
-if (!m.message) return;
-if (m.key.fromMe) return;
+            let m = chatUpdate.messages[0];
+            if (!m.message) return;
+            if (m.key.fromMe) return;
 
-m.chat = m.key.remoteJid;
-m.sender = m.key.participant || m.key.remoteJid;
+            m.chat = m.key.remoteJid;
+            m.sender = m.key.participant || m.key.remoteJid;
 
             if (!global.processedMessages) global.processedMessages = new Set();
             if (global.processedMessages.has(m.key.id)) return;
@@ -214,16 +214,41 @@ m.sender = m.key.participant || m.key.remoteJid;
             if (!body) return;
             let budy = body.trim();
 
-            if (budy.toLowerCase().includes('ping') && !budy.startsWith('.')) budy = '.ping';
-            if (budy.toLowerCase().includes('menu') && !budy.startsWith('.')) budy = '.menu';
-
             let customPrefix = getPrefix();
-            let prefix = budy.startsWith(customPrefix)
-                ? customPrefix
-                : (/^[°•π÷×¶∆£¢€¥®™+✓_=|~!?@#$%^&*.\\/\\#]/.test(budy) ? budy[0] : '');
-            let isCmd = budy.startsWith(prefix);
-            let cmdPart = isCmd ? budy.slice(prefix.length).trim().split(' ') : budy.split(' ');
-            let command = (cmdPart && cmdPart.length > 0) ? cmdPart[0].toLowerCase() : '';
+            let prefix = '';
+            
+            if (budy.startsWith(customPrefix)) {
+                prefix = customPrefix;
+            } else {
+                let firstChar = budy[0];
+                if (/^[°•π÷×¶∆£¢€¥®™+✓_=|~!?@#$%^&*.\\/\\#]/.test(firstChar)) {
+                    prefix = firstChar;
+                }
+            }
+
+            let isCmd = prefix !== '' && budy.startsWith(prefix);
+            let isInteractiveResponse = Boolean(
+                msg.buttonsResponseMessage || 
+                msg.templateButtonReplyMessage || 
+                msg.listResponseMessage || 
+                msg.interactiveResponseMessage
+            );
+
+            if (!isCmd && !isInteractiveResponse) {
+                return;
+            }
+
+            let command = '';
+            let textArg = '';
+
+            if (isCmd) {
+                let cmdPart = budy.slice(prefix.length).trim().split(' ');
+                command = cmdPart[0].toLowerCase();
+                textArg = budy.slice(prefix.length + command.length).trim();
+            } else if (isInteractiveResponse) {
+                command = budy.toLowerCase();
+                textArg = '';
+            }
 
             let jidCorrente = m.key.remoteJid;
             let senderCorrente = m.key.participant || m.key.remoteJid;
@@ -241,7 +266,7 @@ m.sender = m.key.participant || m.key.remoteJid;
             for (let name in plugins) {
                 let plugin = plugins[name];
                 if (plugin.command && plugin.command.test(command)) {
-                    let extra = { conn, text: budy.slice(prefix.length + command.length).trim(), command };
+                    let extra = { conn, text: textArg, command };
                     await plugin(m, extra);
                 }
             }
