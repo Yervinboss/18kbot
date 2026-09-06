@@ -1,83 +1,24 @@
-// plugins/text.js - Scarica e invia l'audio DIRETTAMENTE (Senza comando .song)
+// plugins/text.js - Cerca il testo e invia l'audio direttamente tramite pulsante
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { search } from 'yt-search'; // Libreria corretta per cercare
-import youtubedl from 'youtube-dl-exec'; // Libreria per scaricare audio
+import { search } from 'yt-search';
+import { exec } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const configPath = path.join(__dirname, '../text_config.json');
 
-// ============================================================
-// LEGGI CHIAVI DAL DATABASE
-// ============================================================
-const getGeniusKey = () => {
-    try {
-        if (fs.existsSync(configPath)) {
-            const data = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            return data.genius_token || '';
-        }
-    } catch (e) {}
-    return '';
-};
-
-// ============================================================
-// CERCA SU YOUTUBE
-// ============================================================
 async function findYtUrl(query) {
     try {
         const r = await search(query);
         if (r.videos.length > 0) {
             return { url: r.videos[0].url, title: r.videos[0].title };
         }
-    } catch (e) {
-        console.error('Errore ricerca YouTube:', e);
-    }
+    } catch (e) {}
     return null;
 }
 
-// ============================================================
-// FUNZIONE CHE SCARICA L'AUDIO E LO INVIA SUBITO (VOCALE)
-// ============================================================
-async function sendDirectAudio(conn, jid, ytUrl, title, quotedMsg) {
-    try {
-        // Reazione di caricamento
-        await conn.sendMessage(jid, { react: { text: '🎧', key: quotedMsg.key } });
-
-        // Scarica l'audio in un file temporaneo
-        const output = path.join(__dirname, `../tmp/${Date.now()}.mp3`);
-        await youtubedl(ytUrl, {
-            output: output,
-            extractAudio: true,
-            audioFormat: 'mp3',
-            noPlaylist: true
-        });
-
-        // Leggi il file audio
-        const audioBuffer = fs.readFileSync(output);
-
-        // Invia il vocale immediatamente
-        await conn.sendMessage(jid, { 
-            audio: audioBuffer, 
-            mimetype: 'audio/mpeg', 
-            fileName: `${title || 'Audio'}.mp3`,
-            ptt: true // true = Lo manda come "vocale" di WhatsApp
-        }, { quoted: quotedMsg });
-
-        // Elimina il file temporaneo per non riempire la memoria
-        fs.unlinkSync(output);
-
-    } catch (e) {
-        console.error('Errore invio audio diretto:', e);
-        await conn.sendMessage(jid, { text: '❌ Errore nel download della canzone.' }, { quoted: quotedMsg });
-    }
-}
-
-// ============================================================
-// CERCA TESTO
-// ============================================================
 async function getLyrics(query) {
     let artist = '';
     let title = query;
@@ -110,12 +51,67 @@ async function getLyrics(query) {
     return null;
 }
 
-// ============================================================
-// HANDLER PRINCIPALE (.text)
-// ============================================================
 let handler = async (m, { conn, text, command }) => {
     const jid = m.key.remoteJid;
 
+    // 1. CONTROLLO PREMUTURA PULSANTE (Intercetta l'ID del bottone premuto)
+    let buttonId = 
+        m.message?.buttonsResponseMessage?.selectedButtonId ||
+        m.message?.templateButtonReplyMessage?.selectedId ||
+        m.msg?.selectedButtonId || 
+        m.text; // Alcune librerie passano l'ID direttamente dentro m.text
+
+    if (buttonId && buttonId.startsWith('textplay_')) {
+        let videourl = buttonId.replace('textplay_', '');
+        await conn.sendMessage(jid, { react: { text: '🎧', key: m.key } });
+
+        let inputMp3 = path.join(__dirname, `_temp_text_${Date.now()}.mp3`);
+        let outputOgg = path.join(__dirname, `vocale_text_${Date.now()}.ogg`);
+
+        let yt_command = `yt-dlp -x --audio-format mp3 --audio-quality 192k --extractor-args youtube:player-client=android,web -o "${inputMp3}" "${videourl}"`;
+        
+        exec(yt_command, async (error, stdout, stderr) => {
+            if (error) {
+                console.error('Errore yt-dlp text:', stderr);
+                return await conn.sendMessage(jid, { text: '❌ Errore durante il download del brano.' }, { quoted: m });
+            }
+
+            let ffmpeg_command = `ffmpeg -i "${inputMp3}" -c:a libopus -b:a 128k -ar 48000 -ac 1 -f ogg "${outputOgg}"`;
+            
+            exec(ffmpeg_command, async (err2, stdout2, stderr2) => {
+                if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
+
+                if (err2) {
+                    console.error('Errore conversione ffmpeg text:', stderr2);
+                    return await conn.sendMessage(jid, { text: '❌ Errore nella conversione del vocale.' }, { quoted: m });
+                }
+
+                if (fs.existsSync(outputOgg)) {
+                    try {
+                        let audioBuffer = fs.readFileSync(outputOgg);
+                        await conn.sendMessage(jid, {
+                            audio: audioBuffer,
+                            mimetype: 'audio/ogg; codecs=opus',
+                            ptt: true
+                        }, { quoted: m });
+
+                        await conn.sendMessage(jid, { react: { text: '✅', key: m.key } });
+                    } catch (err) {
+                        console.error('Errore invio audio text:', err);
+                    } finally {
+                        setTimeout(() => {
+                            if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
+                        }, 5000);
+                    }
+                } else {
+                    return await conn.sendMessage(jid, { text: '❌ File vocale non generato.' }, { quoted: m });
+                }
+            });
+        });
+        return; // Blocca l'esecuzione qui per evitare che cerchi il testo di "textplay_"
+    }
+
+    // 2. FUNZIONE DI RICERCA TESTO STANDARD (.text)
     if (!text) {
         return await conn.sendMessage(jid, {
             text: `📝 *CERCA TESTO CANZONE*\n\n📌 *Uso:* \`.text [artista - titolo]\`\n📎 *Esempio:* \`.text Sfera Ebbasta - Visiera H\``
@@ -145,7 +141,6 @@ let handler = async (m, { conn, text, command }) => {
             }
         } catch (e) {}
 
-        // Costruisci il messaggio del testo con il pulsante
         let messageContent = {
             text: `📝 *${source}*\n\n${lyrics.length > 4000 ? lyrics.substring(0, 4000) : lyrics}`,
             footer: ytTitle ? `🎵 *${ytTitle}*` : ''
@@ -154,7 +149,7 @@ let handler = async (m, { conn, text, command }) => {
         if (ytUrl) {
             messageContent.buttons = [
                 {
-                    buttonId: `direct_audio_${ytUrl}`, 
+                    buttonId: `textplay_${ytUrl}`, 
                     buttonText: { displayText: '🎵 Riproduci' },
                     type: 1
                 }
@@ -179,25 +174,8 @@ let handler = async (m, { conn, text, command }) => {
     }
 };
 
-// ============================================================
-// GESTORE DEL CLICK SUL PULSANTE (INVIA DIRETTAMENTE IL VOCALE)
-// ============================================================
-let buttonHandler = async (m, { conn }) => {
-    if (!m.message?.buttonsResponseMessage) return;
-    
-    const selectedId = m.message.buttonsResponseMessage.selectedButtonId;
-    
-    if (selectedId && selectedId.startsWith('direct_audio_')) {
-        const ytUrl = selectedId.replace('direct_audio_', '');
-        const jid = m.key.remoteJid;
-        
-        // Chiama la funzione che scarica e manda SUBITO l'audio
-        await sendDirectAudio(conn, jid, ytUrl, 'Canzone', m);
-    }
-};
-
-handler.command = /^(text|testo|lyrics)$/i;
-handler.button = buttonHandler; // Collega il gestore del click
+// La regex ora accetta sia i comandi normali sia qualsiasi stringa che inizia con textplay_
+handler.command = /^(text|testo|lyrics|textplay_.*)$/i;
 handler.help = ['text'];
 handler.tags = ['musica'];
 
