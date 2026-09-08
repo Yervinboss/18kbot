@@ -1,9 +1,10 @@
-// plugins/text.js - Cerca il testo e invia l'audio direttamente tramite pulsante
+// plugins/text.js - Versione CORRETTA e ottimizzata
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { search } from 'yt-search';
+import pkg from 'yt-search';
+const { search } = pkg;
 import { exec } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -12,10 +13,25 @@ const __dirname = path.dirname(__filename);
 async function findYtUrl(query) {
     try {
         const r = await search(query);
-        if (r.videos.length > 0) {
-            return { url: r.videos[0].url, title: r.videos[0].title };
+        if (r.videos && r.videos.length > 0) {
+            let img = r.videos[0].image || r.videos[0].thumbnail || '';
+            
+            if (img && img.includes('default.jpg')) {
+                img = img.replace('default.jpg', 'hqdefault.jpg');
+            }
+
+            // 🔥 FIX definitivo: Inserito "images.weserv.nl" con i backtick corretti
+            let croppedImage = img ? `https://images.weserv.nl/?url=${encodeURIComponent(img)}&w=500&h=500&fit=cover` : '';
+
+            return { 
+                url: r.videos[0].url, 
+                title: r.videos[0].title,
+                image: croppedImage || img
+            };
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('Errore findYtUrl:', e.message);
+    }
     return null;
 }
 
@@ -25,10 +41,11 @@ async function getLyrics(query) {
 
     if (query.includes(' - ')) {
         const parts = query.split(' - ');
-        artist = parts[0].trim();
-        title = parts[1].trim();
+        artist = parts[0] ? parts[0].trim() : '';
+        title = parts[1] ? parts[1].trim() : query;
     }
 
+    // 🔥 URL corretta per LrcLib
     try {
         const lrclibUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
         const lrclibRes = await axios.get(lrclibUrl);
@@ -36,8 +53,11 @@ async function getLyrics(query) {
             const song = lrclibRes.data[0]; 
             return { lyrics: song.plainLyrics, source: `🎵 ${song.artistName} - ${song.trackName}` };
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('Errore LrcLib:', e.message);
+    }
 
+    // 🔥 URL corretta per Lyrics.ovh
     try {
         if (artist) {
             let url = `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`;
@@ -46,7 +66,9 @@ async function getLyrics(query) {
                 return { lyrics: res.data.lyrics, source: '📝 Lyrics.ovh' };
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('Errore Lyrics.ovh:', e.message);
+    }
 
     return null;
 }
@@ -54,12 +76,11 @@ async function getLyrics(query) {
 let handler = async (m, { conn, text, command }) => {
     const jid = m.key.remoteJid;
 
-    // 1. CONTROLLO PREMUTURA PULSANTE (Intercetta l'ID del bottone premuto)
     let buttonId = 
         m.message?.buttonsResponseMessage?.selectedButtonId ||
         m.message?.templateButtonReplyMessage?.selectedId ||
         m.msg?.selectedButtonId || 
-        m.text; // Alcune librerie passano l'ID direttamente dentro m.text
+        m.text; 
 
     if (buttonId && buttonId.startsWith('textplay_')) {
         let videourl = buttonId.replace('textplay_', '');
@@ -70,48 +91,42 @@ let handler = async (m, { conn, text, command }) => {
 
         let yt_command = `yt-dlp -x --audio-format mp3 --audio-quality 192k --extractor-args youtube:player-client=android,web -o "${inputMp3}" "${videourl}"`;
         
-        exec(yt_command, async (error, stdout, stderr) => {
+        exec(yt_command, async (error) => {
             if (error) {
-                console.error('Errore yt-dlp text:', stderr);
-                return await conn.sendMessage(jid, { text: '❌ Errore durante il download del brano.' }, { quoted: m });
+                if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
+                return await conn.sendMessage(jid, { text: '❌ Errore durante il download.' }, { quoted: m });
             }
 
             let ffmpeg_command = `ffmpeg -i "${inputMp3}" -c:a libopus -b:a 128k -ar 48000 -ac 1 -f ogg "${outputOgg}"`;
             
-            exec(ffmpeg_command, async (err2, stdout2, stderr2) => {
+            exec(ffmpeg_command, async (err2) => {
                 if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
 
-                if (err2) {
-                    console.error('Errore conversione ffmpeg text:', stderr2);
-                    return await conn.sendMessage(jid, { text: '❌ Errore nella conversione del vocale.' }, { quoted: m });
+                if (err2 || !fs.existsSync(outputOgg)) {
+                    if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
+                    return await conn.sendMessage(jid, { text: '❌ Errore conversione.' }, { quoted: m });
                 }
 
-                if (fs.existsSync(outputOgg)) {
-                    try {
-                        let audioBuffer = fs.readFileSync(outputOgg);
-                        await conn.sendMessage(jid, {
-                            audio: audioBuffer,
-                            mimetype: 'audio/ogg; codecs=opus',
-                            ptt: true
-                        }, { quoted: m });
-
-                        await conn.sendMessage(jid, { react: { text: '✅', key: m.key } });
-                    } catch (err) {
-                        console.error('Errore invio audio text:', err);
-                    } finally {
-                        setTimeout(() => {
-                            if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
-                        }, 5000);
-                    }
-                } else {
-                    return await conn.sendMessage(jid, { text: '❌ File vocale non generato.' }, { quoted: m });
+                try {
+                    let audioBuffer = fs.readFileSync(outputOgg);
+                    await conn.sendMessage(jid, {
+                        audio: audioBuffer,
+                        mimetype: 'audio/ogg; codecs=opus',
+                        ptt: true
+                    }, { quoted: m });
+                    await conn.sendMessage(jid, { react: { text: '✅', key: m.key } });
+                } catch (err) {
+                    console.error('Errore invio audio:', err);
+                } finally {
+                    setTimeout(() => {
+                        if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
+                    }, 5000);
                 }
             });
         });
-        return; // Blocca l'esecuzione qui per evitare che cerchi il testo di "textplay_"
+        return; 
     }
 
-    // 2. FUNZIONE DI RICERCA TESTO STANDARD (.text)
     if (!text) {
         return await conn.sendMessage(jid, {
             text: `📝 *CERCA TESTO CANZONE*\n\n📌 *Uso:* \`.text [artista - titolo]\`\n📎 *Esempio:* \`.text Sfera Ebbasta - Visiera H\``
@@ -133,18 +148,34 @@ let handler = async (m, { conn, text, command }) => {
 
         let ytUrl = '';
         let ytTitle = '';
+        let ytImage = '';
+        
         try {
             const yt = await findYtUrl(text); 
             if (yt) {
                 ytUrl = yt.url;
                 ytTitle = yt.title;
+                ytImage = yt.image;
             }
         } catch (e) {}
 
-        let messageContent = {
-            text: `📝 *${source}*\n\n${lyrics.length > 4000 ? lyrics.substring(0, 4000) : lyrics}`,
-            footer: ytTitle ? `🎵 *${ytTitle}*` : ''
-        };
+        let messageText = `📝 *${source}*\n\n${lyrics.length > 4000 ? lyrics.substring(0, 4000) : lyrics}`;
+        let footerText = ytTitle ? `🎵 *${ytTitle}*` : '';
+
+        let messageContent = {};
+
+        if (ytImage) {
+            messageContent = {
+                image: { url: ytImage },
+                caption: messageText,
+                footer: footerText
+            };
+        } else {
+            messageContent = {
+                text: messageText,
+                footer: footerText
+            };
+        }
 
         if (ytUrl) {
             messageContent.buttons = [
@@ -154,7 +185,7 @@ let handler = async (m, { conn, text, command }) => {
                     type: 1
                 }
             ];
-            messageContent.headerType = 1;
+            messageContent.headerType = ytImage ? 4 : 1; 
         }
 
         await conn.sendMessage(jid, messageContent, { quoted: m });
@@ -174,7 +205,6 @@ let handler = async (m, { conn, text, command }) => {
     }
 };
 
-// La regex ora accetta sia i comandi normali sia qualsiasi stringa che inizia con textplay_
 handler.command = /^(text|testo|lyrics|textplay_.*)$/i;
 handler.help = ['text'];
 handler.tags = ['musica'];

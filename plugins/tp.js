@@ -6,9 +6,27 @@ import os from 'os'
 
 global.tpSelection = global.tpSelection || {}
 
-const getThumbnail = (video) => video?.thumbnail || video?.image || video?.images?.[0] || 'icone/333.jpg'
+// 🔥 FIX DEFINITIVO: Sistemate le quadre opzionali ?.[0] e l'immagine di fallback reale di YouTube
+const getThumbnail = (video) => {
+  let img = video?.thumbnail || video?.image || video?.images?.[0] || '';
+  
+  if (!img || img.length < 5 || img.includes('icone/')) {
+      // Endpoint statico ufficiale di YouTube che non restituisce mai 404
+      return 'https://youtube.com';
+  }
+  
+  if (img.endsWith('/default.jpg')) {
+      img = img.replace('/default.jpg', '/mqdefault.jpg');
+  }
+  
+  if (img.includes('default') && !img.includes('youtube.com')) {
+      return img;
+  }
+  
+  // Crop 1:1 ottimizzato per il carosello delle card tramite il dominio wsrv.nl
+  return `https://wsrv.nl/?url=${encodeURIComponent(img)}&w=500&h=500&fit=cover`;
+}
 
-// Funzione di supporto per gestire la logica di download e invio del brano
 async function processTpSelection(conn, m, queryText) {
   let indexNum = Number(queryText)
   if (isNaN(indexNum)) {
@@ -122,7 +140,7 @@ let handler = async (m, { conn, text, command }) => {
       if (!fullStr.startsWith('tp_select') && query.startsWith('.tp_select')) fullStr = query.substring(1)
       let parts = fullStr.split(/\s+/)
       action = 'tp_select'
-      if (parts[1]) query = parts[1]
+      if (parts && parts[1]) query = parts[1]
   }
 
   if (action === 'tp') {
@@ -171,7 +189,6 @@ let handler = async (m, { conn, text, command }) => {
   }
 }
 
-// 🔥 AGGIUNTO IL messageHook: Intercetta i click sui bottoni prima che il main.js li blocchi
 handler.messageHook = async (conn, m) => {
     let buttonId = 
         m.message?.buttonsResponseMessage?.selectedButtonId ||
@@ -188,14 +205,14 @@ handler.messageHook = async (conn, m) => {
 
         if (action.includes('tp_select')) {
             let parts = action.trim().split(/\s+/)
-            let queryNum = parts[1] || action.replace('tp_select', '').trim()
+            let queryNum = parts && parts[1] ? parts[1] : action.replace('tp_select', '').trim()
             await processTpSelection(conn, m, queryNum)
         }
     }
 }
 
-handler.command = /^(tp|tp_select)$/i
+handler.command = /^(tp|tp_select|tp_select.*)$/i
 handler.help = ['tp']
 handler.tags = ['music']
 
-export default handler
+export default handler;
