@@ -5,13 +5,12 @@ import path from 'path'
 import os from 'os'
 
 global.tpSelection = global.tpSelection || {}
+global.tpProcessing = global.tpProcessing || {} // 🔥 Per evitare doppi processamenti
 
-// 🔥 FIX DEFINITIVO: Sistemate le quadre opzionali ?.[0] e l'immagine di fallback reale di YouTube
 const getThumbnail = (video) => {
   let img = video?.thumbnail || video?.image || video?.images?.[0] || '';
   
   if (!img || img.length < 5 || img.includes('icone/')) {
-      // Endpoint statico ufficiale di YouTube che non restituisce mai 404
       return 'https://youtube.com';
   }
   
@@ -23,17 +22,40 @@ const getThumbnail = (video) => {
       return img;
   }
   
-  // Crop 1:1 ottimizzato per il carosello delle card tramite il dominio wsrv.nl
   return `https://wsrv.nl/?url=${encodeURIComponent(img)}&w=500&h=500&fit=cover`;
 }
 
 async function processTpSelection(conn, m, queryText) {
+  // 🔥 FIX 1: Evita doppi processamenti
+  const processKey = `${m.key.id}_${m.sender}`
+  if (global.tpProcessing[processKey]) {
+    return // Già in elaborazione
+  }
+  global.tpProcessing[processKey] = true
+  
+  setTimeout(() => {
+    delete global.tpProcessing[processKey]
+  }, 5000)
+
   let indexNum = Number(queryText)
   if (isNaN(indexNum)) {
     indexNum = Number(queryText.replace('tp_select', '').trim())
   }
 
-  const results = global.tpSelection[m.sender]
+  // 🔥 FIX 2: Permetti a chiunque nel gruppo di selezionare
+  let results = null
+  
+  // Prima controlla se c'è una selezione per questo utente
+  if (global.tpSelection[m.sender]) {
+    results = global.tpSelection[m.sender]
+  } 
+  // Se non c'è, controlla se c'è una selezione per il gruppo
+  else if (m.key.remoteJid && m.key.remoteJid.endsWith('@g.us')) {
+    const chatId = m.key.remoteJid
+    if (global.tpSelection[chatId]) {
+      results = global.tpSelection[chatId]
+    }
+  }
 
   if (!results?.length) {
     return conn.sendMessage(m.key.remoteJid, { 
@@ -43,7 +65,7 @@ async function processTpSelection(conn, m, queryText) {
   
   if (!Number.isInteger(indexNum) || indexNum < 1 || indexNum > results.length) {
     return conn.sendMessage(m.key.remoteJid, { 
-      text: "❌ Seleziona un numero valido tra i risultati mostrati." 
+      text: `❌ Seleziona un numero valido tra 1 e ${results.length}.` 
     }, { quoted: m })
   }
 
@@ -95,6 +117,7 @@ async function processTpSelection(conn, m, queryText) {
                   }, { quoted: m })
 
                   await conn.sendMessage(chatId, { react: { text: '✅', key: m.key } })
+                  
               } catch (err) {
                   console.error('Errore durante invio audio:', err)
               } finally {
@@ -112,37 +135,37 @@ async function processTpSelection(conn, m, queryText) {
 }
 
 let handler = async (m, { conn, text, command }) => {
+  // 🔥 FIX 3: Gestione bottoni - se è un bottone, processa e ESCE
+  let buttonId = null
+  
+  if (m.message?.buttonsResponseMessage?.selectedButtonId) {
+      buttonId = m.message.buttonsResponseMessage.selectedButtonId
+  } else if (m.message?.templateButtonReplyMessage?.selectedId) {
+      buttonId = m.message.templateButtonReplyMessage.selectedId
+  } else if (m.msg?.selectedButtonId) {
+      buttonId = m.msg.selectedButtonId
+  } else if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson) {
+      try {
+          let parsed = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson)
+          if (parsed.id) buttonId = parsed.id
+      } catch (e) {}
+  }
+
+  // 🔥 Se è un bottone tp_select, processa e RETURNA (non continua)
+  if (buttonId && buttonId.toLowerCase().startsWith('tp_select')) {
+      let parts = buttonId.trim().split(/\s+/)
+      let queryNum = parts.length > 1 ? parts[1] : buttonId.replace(/tp_select/i, '').trim()
+      await processTpSelection(conn, m, queryNum)
+      return // 🔥 IMPORTANTE: Esce per non processare due volte
+  }
+
   let cleanText = (text || '').trim()
   cleanText = cleanText.replace(/@[^\s]+/g, '').trim()
   
   let action = (command || '').trim().toLowerCase()
   let query = cleanText
 
-  let buttonId = 
-      m.message?.buttonsResponseMessage?.selectedButtonId ||
-      m.message?.templateButtonReplyMessage?.selectedId ||
-      m.msg?.selectedButtonId ||
-      m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson
-
-  if (buttonId) {
-      try {
-          let parsed = JSON.parse(buttonId)
-          if (parsed.id) action = parsed.id.trim().toLowerCase()
-      } catch (e) {
-          action = buttonId.trim().toLowerCase()
-      }
-  }
-
-  if (action.startsWith('tp_select') || query.startsWith('tp_select') || action.startsWith('.tp_select')) {
-      let fullStr = action
-      if (fullStr.startsWith('.tp_select')) fullStr = fullStr.substring(1)
-      if (!fullStr.startsWith('tp_select') && query.startsWith('tp_select')) fullStr = query
-      if (!fullStr.startsWith('tp_select') && query.startsWith('.tp_select')) fullStr = query.substring(1)
-      let parts = fullStr.split(/\s+/)
-      action = 'tp_select'
-      if (parts && parts[1]) query = parts[1]
-  }
-
+  // Se è un comando normale .tp
   if (action === 'tp') {
     if (!query) {
       return conn.sendMessage(m.key.remoteJid, { 
@@ -160,8 +183,13 @@ let handler = async (m, { conn, text, command }) => {
         text: `❌ Nessun risultato trovato per: "${query}"` 
       }, { quoted: m })
     }
-
+    
+    // 🔥 FIX 4: Salva la selezione sia per l'utente che per il gruppo
+    const chatId = m.key.remoteJid
     global.tpSelection[m.sender] = results
+    if (chatId.endsWith('@g.us')) {
+      global.tpSelection[chatId] = results // Salva anche per il gruppo
+    }
 
     const selectionCards = results.map((video, index) => ({
       image: { url: getThumbnail(video) },
@@ -183,29 +211,31 @@ let handler = async (m, { conn, text, command }) => {
       cards: selectionCards
     }, { quoted: m })
   }
-
-  if (action === 'tp_select') {
-    return await processTpSelection(conn, m, query)
-  }
 }
 
+// 🔥 FIX 5: messageHook processa i bottoni ma controlla se già in processing
 handler.messageHook = async (conn, m) => {
-    let buttonId = 
-        m.message?.buttonsResponseMessage?.selectedButtonId ||
-        m.message?.templateButtonReplyMessage?.selectedId ||
-        m.msg?.selectedButtonId ||
-        m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson
-
-    if (buttonId) {
-        let action = buttonId
+    let buttonId = null
+    
+    if (m.message?.buttonsResponseMessage?.selectedButtonId) {
+        buttonId = m.message.buttonsResponseMessage.selectedButtonId
+    } else if (m.message?.templateButtonReplyMessage?.selectedId) {
+        buttonId = m.message.templateButtonReplyMessage.selectedId
+    } else if (m.msg?.selectedButtonId) {
+        buttonId = m.msg.selectedButtonId
+    } else if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson) {
         try {
-            let parsed = JSON.parse(buttonId)
-            if (parsed.id) action = parsed.id
+            let parsed = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson)
+            if (parsed.id) buttonId = parsed.id
         } catch (e) {}
+    }
 
-        if (action.includes('tp_select')) {
-            let parts = action.trim().split(/\s+/)
-            let queryNum = parts && parts[1] ? parts[1] : action.replace('tp_select', '').trim()
+    // 🔥 Processa SOLO se è tp_select e NON è già in processing
+    if (buttonId && buttonId.toLowerCase().startsWith('tp_select')) {
+        const processKey = `${m.key.id}_${m.sender}`
+        if (!global.tpProcessing[processKey]) {
+            let parts = buttonId.trim().split(/\s+/)
+            let queryNum = parts.length > 1 ? parts[1] : buttonId.replace(/tp_select/i, '').trim()
             await processTpSelection(conn, m, queryNum)
         }
     }

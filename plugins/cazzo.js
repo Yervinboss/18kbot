@@ -5,19 +5,43 @@ function pureId(jid) {
 
 let handler = async (m, { conn }) => {
     let jid = m.key.remoteJid;
-    let senderId = pureId(m.key.participant || m.key.remoteJid);
-
-    // LOGICA DI CONTROLLO BLINDATA: Priorità assoluta al mittente del messaggio citato!
-    let who = false;
-    if (m.quoted && m.quoted.sender) {
-        who = m.quoted.sender;
-    } else if (m.mentionedJid && m.mentionedJid.length > 0) {
-        who = m.mentionedJid;
-    } else if (m.message?.extendedTextMessage?.contextInfo?.mentionedJid && m.message.extendedTextMessage.contextInfo.mentionedJid.length > 0) {
-        who = m.message.extendedTextMessage.contextInfo.mentionedJid;
+    
+    if (!jid.endsWith('@g.us')) {
+        return await conn.sendMessage(jid, { text: '❌ Questo comando può essere usato solo nei gruppi!' }, { quoted: m });
     }
 
-    let targetId = who ? pureId(who) : senderId;
+    let sender = m.key.participant || m.key.remoteJid;
+    let senderId = pureId(m.key.participant || m.key.remoteJid);
+
+    let who = null;
+    if (m.mentionedJid && m.mentionedJid.length > 0) {
+        who = m.mentionedJid[0];
+    } else if (m.quoted && m.quoted.sender) {
+        who = m.quoted.sender;
+    } else if (m.message?.extendedTextMessage?.contextInfo?.mentionedJid && 
+               m.message.extendedTextMessage.contextInfo.mentionedJid.length > 0) {
+        who = m.message.extendedTextMessage.contextInfo.mentionedJid[0];
+    } else {
+        who = sender;
+    }
+
+    let targetId = pureId(who);
+    let targetJid = targetId + '@s.whatsapp.net';
+
+    if (pureId(sender) === targetId && (m.mentionedJid?.length > 0 || m.quoted)) {
+        return await conn.sendMessage(jid, { text: '❌ Non puoi usare .cazzo su te stesso! 😂' }, { quoted: m });
+    }
+
+    try {
+        let groupMetadata = await conn.groupMetadata(jid);
+        let exists = groupMetadata.participants.some(p => pureId(p.id) === targetId);
+        if (!exists) {
+            return await conn.sendMessage(jid, { 
+                text: `❌ L'utente @${targetId} non è presente in questo gruppo!`, 
+                mentions: [targetJid] 
+            }, { quoted: m });
+        }
+    } catch (e) {}
 
     await conn.sendMessage(jid, { react: { text: '⏳', key: m.key } });
 
@@ -29,10 +53,22 @@ let handler = async (m, { conn }) => {
     else if (cm < 20) commento = 'Minchia zio, qua parliamo di un pezzo pesante! 🚀';
     else commento = 'ROBA DA MATTI! Un finale da porno attore, illegale! 👑🍆';
 
+    let isTargetAdmin = false;
+    try {
+        let groupMetadata = await conn.groupMetadata(jid);
+        let participants = groupMetadata.participants;
+        isTargetAdmin = !!participants.find(p => pureId(p.id) === targetId && p.admin);
+    } catch (e) {}
+    
+    const adminTag = isTargetAdmin ? ' 👑 *[ADMIN]*' : '';
+    const isSelf = pureId(sender) === targetId;
+    const selfText = isSelf ? '\n\n🤡 *Hai usato .cazzo su te stesso!* 🤡' : '';
+
     await conn.sendMessage(jid, { react: { text: '🍆', key: m.key } });
+    
     return await conn.sendMessage(jid, { 
-        text: `🍆 *ZENO PISELLOMETRO* 🍆\n\n👤 Utente: @${targetId}\n📏 Lunghezza: *${cm} cm*\n\n📝 *Verdetto:* _${commento}_`,
-        mentions: [targetId + '@s.whatsapp.net']
+        text: `🍆 *ZENO PISELLOMETRO* 🍆\n\n👤 Utente: @${targetId}${adminTag}\n📏 Lunghezza: *${cm} cm*\n\n📝 *Verdetto:* _${commento}_${selfText}\n\n👮 *Richiesto da:* @${pureId(sender)}`,
+        mentions: [targetJid, sender]
     }, { quoted: m });
 };
 
