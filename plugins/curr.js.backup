@@ -1,0 +1,50 @@
+const BASE_URL = process.env.ZENOSITE_URL || 'http://localhost:3000';
+
+let handler = async (m, { conn }) => {
+    let chat = m.key.remoteJid;
+    let sender = m.key.participant || m.key.remoteJid;
+    let number = sender.replace(/[^0-9]/g, '');
+
+    try {
+        let statusRes = await fetch(`${BASE_URL}/api/user/${number}`);
+        let status = await statusRes.json();
+
+        if (!status.registered) {
+            let tokenRes = await fetch(`${BASE_URL}/api/token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ number })
+            });
+            let tokenData = await tokenRes.json();
+            let link = `${BASE_URL}/register?token=${tokenData.token}`;
+
+            return await conn.sendMessage(chat, {
+                text: `🎵 Benvenuto su ZenoSite!\n\nSei nuovo qui — per iniziare devi registrarti. Apri questo link entro 10 minuti:\n\n${link}\n\nUna volta registrato, scrivi di nuovo *.cur* e ti dirò cosa stai ascoltando.`
+            }, { quoted: m });
+        }
+
+        let npRes = await fetch(`${BASE_URL}/api/nowplaying/${number}`);
+        let npData = await npRes.json();
+
+        if (!npData.nowPlaying) {
+            await conn.sendMessage(chat, {
+                text: `🎧 Non stai ascoltando niente al momento.\n\nVai su ${BASE_URL} per far partire qualcosa dalla tua playlist.`
+            }, { quoted: m });
+        } else {
+            let { title, artist } = npData.nowPlaying;
+            await conn.sendMessage(chat, {
+                text: `🎵 Stai ascoltando:\n*${title}*${artist ? ` — ${artist}` : ''}`
+            }, { quoted: m });
+        }
+    } catch (e) {
+        console.error('Errore comando .cur:', e);
+        await conn.sendMessage(chat, { text: '⚠️ Errore nel contattare il sito. Riprova tra poco.' }, { quoted: m });
+    }
+};
+
+handler.help = ['cur'];
+handler.tags = ['media'];
+handler.desc = 'Ti dice cosa stai ascoltando su ZenoSite, o ti registra se sei nuovo';
+handler.command = /^cur$/i;
+
+export default handler;

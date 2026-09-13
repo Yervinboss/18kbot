@@ -22,12 +22,7 @@ const writeDb = (p, data) => {
     } catch (e) {
         console.error('Errore scrittura database playlist:', e);
     }
-};
-
-// ============================================================
-// SPOTIFY - Versione stabile con fetch e scraping diretto
-// ============================================================
-const extractSpotifyTracksNoClient = async (url) => {
+};const extractSpotifyTracksNoClient = async (url) => {
     try {
         const response = await fetch(url, {
             headers: {
@@ -36,12 +31,8 @@ const extractSpotifyTracksNoClient = async (url) => {
         });
 
         const html = await response.text();
-        
-        // Estrai il titolo della pagina
         const titleMatch = html.match(/<title>(.*?)<\/title>/);
-        if (!titleMatch) {
-            return [];
-        }
+        if (!titleMatch) return [];
 
         let title = titleMatch[1]
             .replace(' - Spotify', '')
@@ -49,7 +40,6 @@ const extractSpotifyTracksNoClient = async (url) => {
             .replace('• Spotify', '')
             .trim();
 
-        // Se è una playlist o album, cerchiamo di estrarre più tracce
         const isPlaylist = url.includes('playlist') || url.includes('album');
         
         if (isPlaylist) {
@@ -62,23 +52,152 @@ const extractSpotifyTracksNoClient = async (url) => {
                     return { title: name };
                 }).filter(t => t.title && t.title.length > 0);
                 
-                if (tracks.length > 0) {
-                    return tracks;
-                }
+                if (tracks.length > 0) return tracks;
             }
         }
 
-        // Per singola traccia o fallback
-        if (title) {
-            return [{ title: title }];
-        }
-
+        if (title) return [{ title: title }];
         return [];
     } catch (e) {
         console.error('Errore Spotify:', e.message);
         return [];
     }
 };
+
+function downloadAndConvert(trackUrl, timestamp) {
+    return new Promise((resolve, reject) => {
+        const inputMp3 = path.join(__dirname, `_temp_${timestamp}.mp3`);
+        const outputOgg = path.join(__dirname, `_temp_${timestamp}.ogg`);
+
+        const yt_command = `yt-dlp -x --audio-format mp3 --audio-quality 128k --no-part --extractor-args youtube:player-client=android,web -o "${inputMp3}" "${trackUrl}"`;
+
+        exec(yt_command, (error) => {
+            if (error || !fs.existsSync(inputMp3)) {
+                if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
+                return reject(new Error('Download fallito'));
+            }
+
+            const ffmpeg_command = `ffmpeg -y -i "${inputMp3}" -c:a libopus -b:a 64k -vbr on -compression_level 10 -ar 48000 -ac 1 -threads 0 -f ogg "${outputOgg}"`;
+
+            exec(ffmpeg_command, (err2) => {
+                if (fs.existsSync(inputMp3)) fs.unlinkSync(inputMp3);
+
+                if (err2 || !fs.existsSync(outputOgg)) {
+                    if (fs.existsSync(outputOgg)) fs.unlinkSync(outputOgg);
+                    return reject(new Error('Conversione fallita'));
+                }
+
+                resolve(outputOgg);
+            });
+        });
+    });
+}async function mergePlaylist(conn, jid, sender, userTracks, m) {
+    const sessionDir = path.join(__dirname, `_merge_${Date.now()}`);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    const finalM4a = path.join(__dirname, `playlist_${Date.now()}.m4a`);
+    const listFile = path.join(sessionDir, 'list.txt');
+    const metaFile = path.join(sessionDir, 'meta.txt');
+
+    let statusMsg = await conn.sendMessage(jid, {
+        text: `🎛️ *Fusione playlist avviata*\n\n📊 Brano 0/${userTracks.length}...`
+    });
+
+    let successFiles = [];
+    let successTitles = [];
+    let durations = [];
+
+    for (let i = 0; i < userTracks.length; i++) {
+        const track = userTracks[i];
+        try {
+            const oggFile = await downloadAndConvert(track.url, `${Date.now()}_${i}`);
+            
+            const destFile = path.join(sessionDir, `track_${String(i).padStart(3, '0')}.ogg`);
+            fs.copyFileSync(oggFile, destFile);
+            fs.unlinkSync(oggFile);
+            
+            const duration = await new Promise((resolve) => {
+                exec(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${destFile}"`, (err, stdout) => {
+                    if (err) return resolve(0);
+                    resolve(parseFloat(stdout.trim()) || 0);
+                });
+            });
+
+            successFiles.push(destFile);
+            successTitles.push(track.title || `Brano ${i + 1}`);
+            durations.push(duration);
+
+            await conn.sendMessage(jid, {
+                text: `🎛️ *Fusione playlist in corso...*\n\n📊 Brano ${i + 1}/${userTracks.length} ✅\n🎵 _${track.title?.substring(0, 50) || 'Sconosciuto'}_`,
+                edit: statusMsg.key
+            }).catch(() => {});
+        } catch (e) {
+            console.error(`Errore brano ${i + 1}:`, e.message);
+            await conn.sendMessage(jid, {
+                text: `🎛️ *Fusione in corso...*\n\n📊 Brano ${i + 1}/${userTracks.length} ⚠️ saltato\n🎵 _${track.title?.substring(0, 50) || 'Sconosciuto'}_`,
+                edit: statusMsg.key
+            }).catch(() => {});
+        }
+    }
+
+    if (successFiles.length === 0) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        return await conn.sendMessage(jid, { 
+            text: '❌ Nessun brano è stato scaricato con successo. Riprova più tardi.' 
+        }, { quoted: m });
+    }
+
+    const listContent = successFiles.map(f => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
+    fs.writeFileSync(listFile, listContent, 'utf8');
+
+    let currentTime = 0;
+    let metaContent = ';FFMETADATA1\ntitle=Playlist Zeno Bot\nartist=Zeno Bot\n\n';
+    
+    for (let i = 0; i < successFiles.length; i++) {
+        const startMs = Math.floor(currentTime * 1000);
+        const endMs = Math.floor((currentTime + durations[i]) * 1000);
+        metaContent += `[CHAPTER]\nTIMEBASE=1/1000\nSTART=${startMs}\nEND=${endMs}\ntitle=${successTitles[i].replace(/[\n=;]/g, ' ')}\n\n`;
+        currentTime += durations[i];
+    }
+    
+    fs.writeFileSync(metaFile, metaContent, 'utf8');
+
+    const mergeCmd = `ffmpeg -y -f concat -safe 0 -i "${listFile}" -i "${metaFile}" -map_metadata 1 -c:a aac -b:a 96k -ar 44100 -ac 2 -movflags +faststart "${finalM4a}"`;
+
+    exec(mergeCmd, async (err) => {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+
+        if (err || !fs.existsSync(finalM4a)) {
+            if (fs.existsSync(finalM4a)) fs.unlinkSync(finalM4a);
+            return await conn.sendMessage(jid, {
+                text: '❌ Errore durante la fusione dei brani.'
+            }, { quoted: m });
+        }
+
+        const stats = fs.statSync(finalM4a);
+        const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+
+        try {
+            const audioBuffer = fs.readFileSync(finalM4a);
+            await conn.sendMessage(jid, {
+                audio: audioBuffer,
+                mimetype: 'audio/mp4',
+                ptt: false,
+                fileName: `Playlist_Zeno_${new Date().toISOString().slice(0,10)}.m4a`
+            }, { quoted: m });
+
+            await conn.sendMessage(jid, {
+                text: `✅ *Playlist fusa con successo!*\n\n🎵 *${successFiles.length}* brani con capitoli\n📦 Dimensione: *${sizeMB} MB*\n\n💾 Salva il file e aprilo con VLC / Musicolet per vedere le tracce separate!`,
+                edit: statusMsg.key
+            }).catch(() => {});
+        } catch (e) {
+            console.error('Errore invio file:', e);
+            await conn.sendMessage(jid, { text: '❌ Errore durante l\'invio del file.' }, { quoted: m });
+        } finally {
+            setTimeout(() => { if (fs.existsSync(finalM4a)) fs.unlinkSync(finalM4a); }, 10000);
+        }
+    });
+}
 
 async function processQueue(conn, jid, sender) {
     let queueData = global.plQueues[sender];
@@ -133,15 +252,24 @@ async function processQueue(conn, jid, sender) {
             }
         });
     });
-}
-
-let handler = async (m, { conn, text, command }) => {
+}let handler = async (m, { conn, text, command }) => {
     let jid = m.key.remoteJid;
     let sender = m.key.fromMe ? jid : (m.sender || m.key.participant || m.participant || jid);
 
     let selectedCmd = command ? `.${command}` : '';
     if (text) selectedCmd += ` ${text}`;
     selectedCmd = selectedCmd.trim().toLowerCase();
+
+    if (selectedCmd.startsWith('.pl_merge') || selectedCmd.startsWith('.pl_fusion') || command === 'pl_merge' || command === 'pl_fusion') {
+        let plDb = readDb(playlistDbPath);
+        let userTracks = plDb[sender] || [];
+
+        if (userTracks.length === 0) {
+            return await conn.sendMessage(jid, { text: '❌ La tua playlist è vuota. Aggiungi brani con `.pl add [link]`.' }, { quoted: m });
+        }
+
+        return await mergePlaylist(conn, jid, sender, userTracks, m);
+    }
 
     if (selectedCmd === '.pl_stop' || command === 'pl_stop' || text === 'stop') {
         if (global.plQueues[sender]) {
@@ -182,7 +310,6 @@ let handler = async (m, { conn, text, command }) => {
             return await conn.sendMessage(jid, { text: '❌ Inserisci un link valido dopo `add` (Esempio: `.pl add [link]`).' }, { quoted: m });
         }
 
-        // 🔥 SPOTIFY CON fetch
         if (linkTootip.includes('spotify.com')) {
             await conn.sendMessage(jid, { text: '⏳ Analisi link Spotify in corso...' }, { quoted: m });
 
@@ -223,7 +350,6 @@ let handler = async (m, { conn, text, command }) => {
             }, { quoted: m });
         }
 
-        // YouTube standard
         let dumpCmd = `yt-dlp --flat-playlist --dump-json "${linkTootip}"`;
 
         exec(dumpCmd, { maxBuffer: 1024 * 1024 * 10 }, async (err, stdout) => {
@@ -337,6 +463,7 @@ let handler = async (m, { conn, text, command }) => {
         description: `Rimuovi con .pl del ${idx + 1}`
     }));
 
+    rows.unshift({ title: "🎛️ Fondi Playlist (ascolto offline)", rowId: ".pl_merge", description: "Un unico file con tutte le canzoni" });
     rows.unshift({ title: "⏹️ Ferma Riproduzione (Stop)", rowId: ".pl_stop", description: "Interrompi la coda" });
     rows.unshift({ title: "▶️ Riproduci Intera Playlist", rowId: ".pl_all", description: "Ascolta in sequenza" });
 
@@ -349,9 +476,7 @@ let handler = async (m, { conn, text, command }) => {
     };
 
     await conn.sendMessage(jid, listMessage, { quoted: m });
-};
-
-handler.command = /^(pl|pl_all|pl_stop|pl_del|pl_add|pl_select_\d+)$/i;
+};handler.command = /^(pl|pl_all|pl_stop|pl_del|pl_add|pl_merge|pl_fusion|pl_select_\d+)$/i;
 
 handler.all = async function (m, { conn }) {
     if (m.isBaileys || !m.message) return;
@@ -366,7 +491,7 @@ handler.all = async function (m, { conn }) {
         } catch (e) {}
     }
 
-    if (rowId && (rowId.startsWith('.pl_select_') || rowId === '.pl_all' || rowId === '.pl_stop')) {
+    if (rowId && (rowId.startsWith('.pl_select_') || rowId === '.pl_all' || rowId === '.pl_stop' || rowId === '.pl_merge')) {
         let cleanCmd = rowId.replace('.', '');
         m.sender = m.key.fromMe ? m.key.remoteJid : (m.key.participant || m.participant || m.key.remoteJid);
         
@@ -377,6 +502,8 @@ handler.all = async function (m, { conn }) {
             fakeCommand = 'pl_all';
         } else if (rowId === '.pl_stop') {
             fakeCommand = 'pl_stop';
+        } else if (rowId === '.pl_merge') {
+            fakeCommand = 'pl_merge';
         } else {
             fakeCommand = cleanCmd; 
             fakeText = '';
