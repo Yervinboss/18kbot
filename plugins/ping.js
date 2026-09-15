@@ -39,7 +39,8 @@ let handler = async (m, { conn }) => {
     let totalMem = os.totalmem()
     let uptime = process.uptime()
 
-    let sentMsg = await conn.sendMessage(chatId, { text: '🏓 Calcolo ping...' }, { quoted: m })
+    // Invio iniziale senza quoted
+    let sentMsg = await conn.sendMessage(chatId, { text: '🏓 Calcolo ping...' })
     let latency = Date.now() - start
 
     let txt = `╭━━━〔 *ZENO BOT STATUS* 〕━━━⬣\n`
@@ -52,8 +53,9 @@ let handler = async (m, { conn }) => {
     txt += `┃ 📱 *Piattaforma:* ${os.platform()} (${os.arch()})\n`
     txt += `╰━━━━━━━━━━━━━━━━━━━━━━⬣`
 
-    return conn.sendMessage(chatId, { text: txt, edit: sentMsg.key }, { quoted: m })
-        .catch(() => conn.sendMessage(chatId, { text: txt }, { quoted: m }))
+    // Modifica del messaggio senza quoted (fondamentale per evitare il bug)
+    return conn.sendMessage(chatId, { text: txt, edit: sentMsg.key })
+        .catch(() => conn.sendMessage(chatId, { text: txt }))
 }
 
 handler.command = /^(ping|stats|status)$/i

@@ -22,7 +22,9 @@ const writeDb = (p, data) => {
     } catch (e) {
         console.error('Errore scrittura database playlist:', e);
     }
-};const extractSpotifyTracksNoClient = async (url) => {
+};
+
+const extractSpotifyTracksNoClient = async (url) => {
     try {
         const response = await fetch(url, {
             headers: {
@@ -91,7 +93,9 @@ function downloadAndConvert(trackUrl, timestamp) {
             });
         });
     });
-}async function mergePlaylist(conn, jid, sender, userTracks, m) {
+}
+
+async function mergePlaylist(conn, jid, sender, userTracks, m) {
     const sessionDir = path.join(__dirname, `_merge_${Date.now()}`);
     fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -252,13 +256,27 @@ async function processQueue(conn, jid, sender) {
             }
         });
     });
-}let handler = async (m, { conn, text, command }) => {
+}
+let handler = async (m, { conn, text, command }) => {
     let jid = m.key.remoteJid;
-    let sender = m.key.fromMe ? jid : (m.sender || m.key.participant || m.participant || jid);
+    let sender = m.key.participant || m.participant || jid;
 
     let selectedCmd = command ? `.${command}` : '';
     if (text) selectedCmd += ` ${text}`;
     selectedCmd = selectedCmd.trim().toLowerCase();
+
+    // Supporto intercettazione click riga dal menu
+    let mMsg = m.message || m.msg || {};
+    if (mMsg.listResponseMessage?.singleSelectReply?.selectedRowId) {
+        selectedCmd = mMsg.listResponseMessage.singleSelectReply.selectedRowId.toLowerCase();
+        command = selectedCmd.replace('.', '').trim();
+    } else if (mMsg.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+        try {
+            let jsonReply = JSON.parse(mMsg.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
+            selectedCmd = (jsonReply.id || jsonReply.rowId || '').toLowerCase();
+            command = selectedCmd.replace('.', '').trim();
+        } catch (e) {}
+    }
 
     if (selectedCmd.startsWith('.pl_merge') || selectedCmd.startsWith('.pl_fusion') || command === 'pl_merge' || command === 'pl_fusion') {
         let plDb = readDb(playlistDbPath);
@@ -457,67 +475,65 @@ async function processQueue(conn, jid, sender) {
         return await conn.sendMessage(jid, { text: '❌ La tua playlist (.pl) è vuota! Aggiungi un brano o una playlist con `.pl add [link]`.' }, { quoted: m });
     }
 
+    // Costruzione menu interattivo esattamente come nel file menu.js
     let rows = userTracks.map((track, idx) => ({
         title: `${idx + 1}. ${track.title || 'Sconosciuto'}`,
         rowId: `.pl_select_${idx}`,
-        description: `Rimuovi con .pl del ${idx + 1}`
+        description: `Ascolta singolarmente questo brano`
     }));
 
-    rows.unshift({ title: "🎛️ Fondi Playlist (ascolto offline)", rowId: ".pl_merge", description: "Un unico file con tutte le canzoni" });
-    rows.unshift({ title: "⏹️ Ferma Riproduzione (Stop)", rowId: ".pl_stop", description: "Interrompi la coda" });
-    rows.unshift({ title: "▶️ Riproduci Intera Playlist", rowId: ".pl_all", description: "Ascolta in sequenza" });
+    rows.unshift({ title: "🎛️ Fondi Playlist (Audio offline)", rowId: ".pl_merge", description: "Crea un unico file con tutte le tracce" });
+    rows.unshift({ title: "⏹️ Ferma Riproduzione (Stop)", rowId: ".pl_stop", description: "Interrompi la coda continua in corso" });
+    rows.unshift({ title: "▶️ Avvia Coda Continua", rowId: ".pl_all", description: "Ascolta tutti i brani in sequenza automatica" });
+
+    let sections = [
+        {
+            title: "📂 Gestione e Brani Salvati",
+            rows: rows
+        }
+    ];
 
     let listMessage = {
-        text: `✨ *Zeno Bot - La tua Playlist*\n\nGestisci i tuoi brani o aggiungi nuovi link con \`.pl add [link]\`:`,
-        footer: "Zeno Bot • Playlist Personale",
-        title: "📂 Archivio Musica",
-        buttonText: "📜 Gestisci Playlist",
-        sections: [{ title: `🎵 Brani (${userTracks.length})`, rows }]
+        text: `🎵 *LA TUA PLAYLIST* 🎵\nTotale brani salvati: *${userTracks.length}*\n\n🎛️ _Tocca il pulsante qui sotto per aprire il menu interattivo:_`,
+        footer: "Zeno Bot • Music Playlist",
+        title: "🎛️ MENU PLAYLIST",
+        buttonText: "Apri Playlist",
+        sections
     };
 
-    await conn.sendMessage(jid, listMessage, { quoted: m });
-};handler.command = /^(pl|pl_all|pl_stop|pl_del|pl_add|pl_merge|pl_fusion|pl_select_\d+)$/i;
+    return await conn.sendMessage(jid, listMessage, { quoted: m });
+};
 
+handler.command = /^pl(_.*)?$/i;
+handler.help = ['pl'];
+handler.tags = ['downloader'];
+
+// Handler globale per intercettare i click sulle righe del menu interattivo di pl
 handler.all = async function (m, { conn }) {
     if (m.isBaileys || !m.message) return;
 
     let rowId = '';
-    if (m.message?.listResponseMessage?.singleSelectReply?.selectedRowId) {
-        rowId = m.message.listResponseMessage.singleSelectReply.selectedRowId;
-    } else if (m.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
+    let mMsg = m.message || m.msg || {};
+    if (mMsg.listResponseMessage?.singleSelectReply?.selectedRowId) {
+        rowId = mMsg.listResponseMessage.singleSelectReply.selectedRowId;
+    } else if (mMsg.interactiveResponseMessage?.nativeFlowResponseMessage?.buttonReplyValue) {
         try {
-            let jsonReply = JSON.parse(m.message.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
+            let jsonReply = JSON.parse(mMsg.interactiveResponseMessage.nativeFlowResponseMessage.buttonReplyValue);
             rowId = jsonReply.id || jsonReply.rowId || '';
         } catch (e) {}
     }
 
-    if (rowId && (rowId.startsWith('.pl_select_') || rowId === '.pl_all' || rowId === '.pl_stop' || rowId === '.pl_merge')) {
+    if (rowId && (rowId.startsWith('.pl') || rowId === 'pl_merge' || rowId === 'pl_stop' || rowId === 'pl_all')) {
         let cleanCmd = rowId.replace('.', '');
+        let parts = cleanCmd.split(' ');
+        let arg = parts.slice(1).join(' ');
+        let cmdName = parts[0];
+        
         m.sender = m.key.fromMe ? m.key.remoteJid : (m.key.participant || m.participant || m.key.remoteJid);
         
-        let fakeText = '';
-        let fakeCommand = '';
-
-        if (rowId === '.pl_all') {
-            fakeCommand = 'pl_all';
-        } else if (rowId === '.pl_stop') {
-            fakeCommand = 'pl_stop';
-        } else if (rowId === '.pl_merge') {
-            fakeCommand = 'pl_merge';
-        } else {
-            fakeCommand = cleanCmd; 
-            fakeText = '';
-        }
-
-        try {
-            await handler(m, { conn, text: fakeText, command: fakeCommand });
-        } catch (e) {
-            console.error('Errore gestione interazione playlist:', e);
-        }
+        return await handler(m, { conn, text: arg, command: cmdName });
     }
 };
 
-handler.help = ['pl'];
-handler.tags = ['downloader'];
-
 export default handler;
+

@@ -1,4 +1,4 @@
-import { makeWASocket, useMultiFileAuthState } from '@realvare/baileys';
+import { makeWASocket, useMultiFileAuthState } from '@itsliaaa/baileys';
 import { Boom } from '@hapi/boom';
 import chalk from 'chalk';
 import fs from 'fs';
@@ -11,25 +11,60 @@ import { getPrefix } from './plugins/prefix.js';
 const plugins = {};
 const pluginFolder = path.resolve('plugins');
 const SESSION_PATH = process.env.ZENO_SESSION_PATH || 'sessions';
+const LOG_DIR = path.resolve('logs');
 
-// Cache metadata gruppi (per evitare troppe chiamate a conn.groupMetadata)
-const groupMetadataCache = new Map(); // jid -> { data, ts }
-const GROUP_METADATA_TTL = 5 * 60 * 1000; // 5 minuti
+// Cache metadati gruppi con TTL (5 minuti)
+const groupMetadataCache = new Map(); 
+const GROUP_METADATA_TTL = 5 * 60 * 1000; 
+
+// Cooldown utenti per anti-spam (sender -> timestamp)
+const userCooldowns = new Map();
+const COOLDOWN_TIME = 3000; // 3 secondi
 
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 60_000; // 1 minuto
 
+// Sistema di Logging Avanzato su File
+function logToFile(type, text) {
+    try {
+        if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+        const logFile = path.join(LOG_DIR, 'zenobot.log');
+        const timestamp = new Date().toISOString();
+        const logLine = `[${timestamp}] [${type.toUpperCase()}] ${text}\n`;
+        fs.appendFileSync(logFile, logLine, 'utf-8');
+    } catch (e) {
+        // Fallback silenzioso
+    }
+}
+
+// Scrittura Atomica JSON (Evita corruzione database)
+global.saveJsonAtomic = function(filePath, data) {
+    const tempPath = `${filePath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
+    fs.renameSync(tempPath, filePath);
+};
+
 process.on('unhandledRejection', (reason) => {
-    console.log(chalk.red('[!] Promise non gestita (il bot resta acceso):'), reason?.message || reason);
-});
-process.on('uncaughtException', (err) => {
-    console.log(chalk.red('[!] Eccezione non gestita (il bot resta acceso):'), err?.message || err);
+    const msg = reason?.message || reason;
+    console.log(chalk.red('[!] Promise non gestita (il bot resta acceso):'), msg);
+    logToFile('error', `Unhandled Rejection: ${msg}`);
 });
 
+process.on('uncaughtException', (err) => {
+    const msg = err?.message || err;
+    console.log(chalk.red('[!] Eccezione non gestita (il bot resta acceso):'), msg);
+    logToFile('error', `Uncaught Exception: ${msg}`);
+});
+
+// Caricamento Dinamico dei Plugin (Supporta Hot-Reload)
 async function loadPlugins() {
     if (!fs.existsSync(pluginFolder)) {
         fs.mkdirSync(pluginFolder, { recursive: true });
     }
+    
+    Object.keys(plugins).forEach(key => delete plugins[key]);
+    if (global.zenoPluginsList) global.zenoPluginsList = [];
+
     const files = fs.readdirSync(pluginFolder);
     let loadedCount = 0;
     let failedCount = 0;
@@ -41,7 +76,6 @@ async function loadPlugins() {
             let filePath = path.join(pluginFolder, file);
             let module = await import(`${pathToFileURL(filePath)}?update=${Date.now()}`);
 
-            // Validazione: un plugin deve esportare una funzione come default
             if (typeof module.default !== 'function') {
                 throw new Error(`export default mancante o non è una funzione (trovato: ${typeof module.default})`);
             }
@@ -52,7 +86,6 @@ async function loadPlugins() {
                 plugins[file].messageHook = module.messageHook;
             }
 
-            // Ricava il nome comando vero dal primo alias della regex (es. "song" da /^(song|play)$/i)
             let cmdName = file;
             if (module.default.command?.source) {
                 let firstAlias = module.default.command.source
@@ -62,7 +95,6 @@ async function loadPlugins() {
             }
 
             if (!global.zenoPluginsList) global.zenoPluginsList = [];
-            global.zenoPluginsList = global.zenoPluginsList.filter(p => p.file !== file);
             global.zenoPluginsList.push({
                 file,
                 name: cmdName,
@@ -75,28 +107,18 @@ async function loadPlugins() {
         } catch (e) {
             failedCount++;
             console.log(chalk.red(`[Errore Plugin] ${file}: ${e.message}`));
+            logToFile('error', `Plugin Error [${file}]: ${e.message}`);
         }
     }
 
     console.log(chalk.green(`🟢 Caricati con successo ${loadedCount} comandi plugin!`));
+    logToFile('info', `Caricati con successo ${loadedCount} comandi plugin (${failedCount} falliti).`);
     if (failedCount > 0) {
         console.log(chalk.yellow(`⚠️ ${failedCount} plugin non caricati (vedi errori sopra)`));
     }
 }
 
-// Fetch con timeout, per non restare mai appesi su host lenti/morti
-async function fetchWithTimeout(url, ms = 8000) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), ms);
-    try {
-        return await fetch(url, { signal: controller.signal });
-    } catch (e) {
-        return null;
-    } finally {
-        clearTimeout(timeout);
-    }
-}
-
+// Recupero metadati con cache attiva
 async function getGroupMetadataCached(conn, jid) {
     const cached = groupMetadataCache.get(jid);
     if (cached && (Date.now() - cached.ts) < GROUP_METADATA_TTL) {
@@ -108,13 +130,17 @@ async function getGroupMetadataCached(conn, jid) {
 }
 
 function initSocket() {
-    const authPromise = useMultiFileAuthState(SESSION_PATH);
-
-    authPromise.then(async ({ state, saveCreds }) => {
+    useMultiFileAuthState(SESSION_PATH).then(async ({ state, saveCreds }) => {
         const conn = makeWASocket({
             auth: state,
             printQRInTerminal: true,
-            logger: (await import('pino')).default({ level: 'silent' })
+            logger: (await import('pino')).default({ level: 'silent' }),
+            // Salvagente crittografico per evitare il blocco "In attesa del messaggio" nei gruppi
+            getMessage: async (key) => {
+                return {
+                    conversation: "ZenoBot sync message"
+                };
+            }
         });
 
         conn.plugins = plugins;
@@ -128,103 +154,55 @@ function initSocket() {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
                 if (reason === 401) {
                     console.log(chalk.red('[!] Sessione invalidata (401). Cancella la cartella sessions e riscansiona il QR.'));
+                    logToFile('error', 'Sessione invalidata (401).');
                     process.exit(1);
                 } else {
                     reconnectAttempts++;
                     const delay = Math.min(1000 * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY);
                     console.log(chalk.red(`[!] Connessione chiusa (codice: ${reason}), riconnessione tra ${delay / 1000}s (tentativo ${reconnectAttempts})...`));
+                    logToFile('warn', `Connessione chiusa (codice: ${reason}), riconnessione tra ${delay / 1000}s.`);
                     setTimeout(() => initSocket(), delay);
                 }
             } else if (connection === 'open') {
                 reconnectAttempts = 0;
                 console.log(chalk.green('\n✓ Zeno Bot connesso a WhatsApp con successo!\n'));
+                logToFile('info', 'Zeno Bot connesso a WhatsApp con successo.');
             }
         });
 
         conn.ev.on('creds.update', saveCreds);
 
-        conn.ev.on('group-participants.update', async (anu) => {
-            try {
-                if (anu.action !== 'add') return;
-
-                const jid = anu.id;
-                const welcomeDbPath = path.resolve('database/welcome.json');
-                if (!fs.existsSync(welcomeDbPath)) return;
-
-                const db = JSON.parse(fs.readFileSync(welcomeDbPath, 'utf-8'));
-                if (!db[jid] || !db[jid].enabled) return;
-
-                const groupMetadata = await getGroupMetadataCached(conn, jid);
-                const groupName = groupMetadata ? groupMetadata.subject : 'Gruppo';
-
-                for (let num of anu.participants) {
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-
-                    let userId = num.replace(/[^0-9]/g, '');
-                    let userIdJid = num.includes('@') ? num : num + '@s.whatsapp.net';
-
-                    let msgText = db[jid].message.replace(/@user/g, '').trim() + ' @' + userId;
-
-                    let profileLink = null;
-                    try {
-                        let pfp = await conn.profilePictureUrl(userIdJid, 'image').catch(() => null);
-                        if (pfp) profileLink = pfp;
-                    } catch (e) {}
-
-                    if (!profileLink) {
-                        profileLink = `https://ui-avatars.com/api/?name=WA&size=512&background=random&bold=true`;
-                    }
-
-                    let thumbBuffer = null;
-                    try {
-                        let res = await fetchWithTimeout(profileLink);
-                        if (res && res.ok && res.headers.get('content-type')?.startsWith('image/')) {
-                            let arrayBuffer = await res.arrayBuffer();
-                            thumbBuffer = Buffer.from(arrayBuffer);
-                        }
-                    } catch (e) {}
-
-                    await conn.sendMessage(jid, {
-                        text: msgText,
-                        contextInfo: {
-                            mentionedJid: [userIdJid],
-                            externalAdReply: {
-                                title: `✨ Benvenuto in ${groupName}`,
-                                body: `Sei il membro numero ${groupMetadata?.participants?.length || 'nuovo'}`,
-                                previewType: 'PHOTO',
-                                thumbnail: thumbBuffer,
-                                jpegThumbnail: thumbBuffer,
-                                sourceUrl: 'https://wa.me/' + userId,
-                                mediaType: 1,
-                                renderLargerThumbnail: true
-                            }
-                        }
-                    });
-                }
-            } catch (e) {
-                console.error('Errore nel sistema Welcome automatico:', e);
-            }
-        });
-
+        // Gestione messaggi in arrivo
         conn.ev.on('messages.upsert', async (chatUpdate) => {
             try {
                 let m = chatUpdate.messages[0];
                 if (!m.message) return;
                 if (m.key.fromMe) return;
 
+                let msg = m.message;
+
+                // Filtro anti-blocco: ignora messaggi di servizio di cifratura che causano "In attesa del messaggio"
+                if (msg.protocolMessage || msg.senderKeyDistributionMessage) {
+                    return;
+                }
+
                 m.chat = m.key.remoteJid;
                 m.sender = m.key.participant || m.key.remoteJid;
 
-                // Ignora status/broadcast e chat non rilevanti
                 if (m.chat === 'status@broadcast') return;
 
+                // Prevenzione Memory Leak per i messaggi processati
                 if (!global.processedMessages) global.processedMessages = new Set();
                 if (global.processedMessages.has(m.key.id)) return;
                 global.processedMessages.add(m.key.id);
                 if (global.processedMessages.size > 500) {
-                    global.processedMessages = new Set([...global.processedMessages].slice(-250));
+                    const iterator = global.processedMessages.values();
+                    for (let i = 0; i < 250; i++) {
+                        global.processedMessages.delete(iterator.next().value);
+                    }
                 }
 
+                // Esecuzione messageHooks dei plugin
                 for (let name in plugins) {
                     let plugin = plugins[name];
                     if (typeof plugin.messageHook === 'function') {
@@ -236,7 +214,6 @@ function initSocket() {
                     }
                 }
 
-                let msg = m.message;
                 let body = '';
 
                 if (msg.conversation) {
@@ -288,9 +265,7 @@ function initSocket() {
                     msg.interactiveResponseMessage
                 );
 
-                if (!isCmd && !isInteractiveResponse) {
-                    return;
-                }
+                if (!isCmd && !isInteractiveResponse) return;
 
                 let command = '';
                 let textArg = '';
@@ -307,6 +282,24 @@ function initSocket() {
                 let jidCorrente = m.key.remoteJid;
                 let senderCorrente = m.key.participant || m.key.remoteJid;
 
+                // Gestione Comando Hot-Reload (.reload) riservato all'owner
+                if (command === 'reload' && isOwner(senderCorrente)) {
+                    await loadPlugins();
+                    await conn.sendMessage(jidCorrente, { text: '🟢 Tutti i plugin sono stati ricaricati con successo a caldo!' }, { quoted: m });
+                    return;
+                }
+
+                // Controllo Anti-Spam / Cooldown (esclude l'owner)
+                if (!isOwner(senderCorrente)) {
+                    const lastTime = userCooldowns.get(senderCorrente) || 0;
+                    const now = Date.now();
+                    if (now - lastTime < COOLDOWN_TIME) {
+                        return; // Ignora silenziosamente lo spam
+                    }
+                    userCooldowns.set(senderCorrente, now);
+                }
+
+                // Controllo SoloAdmin
                 if (jidCorrente.endsWith('@g.us') && isSoloAdminActive(jidCorrente)) {
                     let isToggleCommand = command === 'soloadminon' || command === 'soloadminoff';
                     if (!isToggleCommand && !isOwner(senderCorrente)) {
@@ -317,6 +310,7 @@ function initSocket() {
                     }
                 }
 
+                // Esecuzione dei comandi plugin
                 for (let name in plugins) {
                     let plugin = plugins[name];
                     if (plugin.command && plugin.command.test(command)) {
@@ -325,6 +319,7 @@ function initSocket() {
                             await plugin(m, extra);
                         } catch (e) {
                             console.error(`Errore nel plugin "${name}" (comando "${command}"):`, e);
+                            logToFile('error', `Plugin Execution Error [${name} / ${command}]: ${e.message}`);
                         }
                     }
                 }
@@ -334,6 +329,7 @@ function initSocket() {
         });
     }).catch((e) => {
         console.error(chalk.red('[!] Errore inizializzazione socket, riprovo tra 5s:'), e);
+        logToFile('error', `Socket Init Error: ${e.message}`);
         setTimeout(() => initSocket(), 5000);
     });
 }
@@ -343,13 +339,15 @@ async function startZenoBot() {
     initSocket();
 }
 
-// Chiusura pulita
+// Chiusura pulita dei processi
 process.on('SIGINT', () => {
     console.log(chalk.yellow('\n[!] Arresto richiesto (SIGINT), chiudo Zeno Bot...'));
+    logToFile('info', 'Arresto richiesto (SIGINT).');
     process.exit(0);
 });
 process.on('SIGTERM', () => {
     console.log(chalk.yellow('\n[!] Arresto richiesto (SIGTERM), chiudo Zeno Bot...'));
+    logToFile('info', 'Arresto richiesto (SIGTERM).');
     process.exit(0);
 });
 
