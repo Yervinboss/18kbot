@@ -17,7 +17,7 @@ function writeDb(data) {
 }
 
 // ============================================================
-// 🔧 DOWNLOAD MEDIA per @realvare/baileys (Aggiornato)
+// 🔧 DOWNLOAD MEDIA per @whiskeysockets/baileys (Aggiornato)
 // ============================================================
 async function downloadMedia(m, conn) {
     let mediaMsg = null;
@@ -57,16 +57,16 @@ async function downloadMedia(m, conn) {
     const type = (mediaMsg.mimetype || '').includes('video') ? 'video' : 'image';
     let buffer = null;
 
-    // === METODO 1: downloadContentFromMessage da @realvare/baileys ===
+    // === METODO 1: downloadContentFromMessage da @whiskeysockets/baileys ===
     try {
-        const baileys = await import('@realvare/baileys');
+        const baileys = await import('@whiskeysockets/baileys');
         const downloadFn = baileys.downloadContentFromMessage || baileys.default?.downloadContentFromMessage;
         if (downloadFn) {
             const stream = await downloadFn(mediaMsg, type);
             let chunks = [];
             for await (const chunk of stream) chunks.push(chunk);
             buffer = Buffer.concat(chunks);
-            console.log('[SETMENU] ✅ Metodo 1 (@realvare/baileys downloadContentFromMessage) OK');
+            console.log('[SETMENU] ✅ Metodo 1 (@whiskeysockets/baileys downloadContentFromMessage) OK');
         }
     } catch (e) { console.log('[SETMENU] ❌ Metodo 1 fallito:', e.message); }
 
@@ -95,7 +95,7 @@ async function downloadMedia(m, conn) {
     // === METODO 4: getFile da baileys ===
     if (!buffer) {
         try {
-            const baileys = await import('@realvare/baileys');
+            const baileys = await import('@whiskeysockets/baileys');
             const getFile = baileys.getFile || baileys.default?.getFile;
             if (getFile) {
                 buffer = await getFile(mediaMsg, 'buffer');

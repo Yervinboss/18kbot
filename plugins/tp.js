@@ -1,28 +1,51 @@
-import yts from 'yt-search'
 import { exec } from 'child_process'
+import { promisify } from 'util'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
 
+const execAsync = promisify(exec)
+
 global.tpSelection = global.tpSelection || {}
 global.tpProcessing = global.tpProcessing || {} // 🔥 Per evitare doppi processamenti
 
-const getThumbnail = (video) => {
-  let img = video?.thumbnail || video?.image || video?.images?.[0] || '';
-  
-  if (!img || img.length < 5 || img.includes('icone/')) {
-      return 'https://youtube.com';
+// 🔥 FIX: yt-search era rotto (bug di parsing lato libreria). Cerchiamo con
+// yt-dlp, già installato e usato per il download, molto più stabile.
+async function searchYoutube(query, limit = 5) {
+  const safeQuery = query.replace(/"/g, '')
+  const cmd = `yt-dlp "ytsearch${limit}:${safeQuery}" --flat-playlist --dump-json --extractor-args youtube:player-client=android,web`
+
+  const { stdout } = await execAsync(cmd, { maxBuffer: 1024 * 1024 * 10 })
+
+  const lines = stdout.split('\n').filter(line => line.trim().length > 0)
+  const results = []
+
+  for (const line of lines) {
+    try {
+      const data = JSON.parse(line)
+      if (!data?.id || !data?.title) continue
+
+      let thumb = ''
+      if (Array.isArray(data.thumbnails) && data.thumbnails.length) {
+        thumb = data.thumbnails[data.thumbnails.length - 1].url
+      } else if (data.thumbnail) {
+        thumb = data.thumbnail
+      }
+
+      results.push({
+        title: String(data.title),
+        url: `https://www.youtube.com/watch?v=${data.id}`,
+        author: { name: data.channel || data.uploader || 'Sconosciuto' },
+        timestamp: data.duration_string || '—',
+        views: typeof data.view_count === 'number' ? data.view_count.toLocaleString() : '—',
+        thumbnail: thumb
+      })
+    } catch (e) {
+      // Riga non valida, la saltiamo senza far crashare tutto
+    }
   }
-  
-  if (img.endsWith('/default.jpg')) {
-      img = img.replace('/default.jpg', '/mqdefault.jpg');
-  }
-  
-  if (img.includes('default') && !img.includes('youtube.com')) {
-      return img;
-  }
-  
-  return `https://wsrv.nl/?url=${encodeURIComponent(img)}&w=500&h=500&fit=cover`;
+
+  return results
 }
 
 async function processTpSelection(conn, m, queryText) {
@@ -175,8 +198,15 @@ let handler = async (m, { conn, text, command }) => {
 
     await conn.sendMessage(m.key.remoteJid, { react: { text: '⏳', key: m.key } })
 
-    let search = await yts(query)
-    let results = search.videos.slice(0, 5)
+    let results
+    try {
+      results = await searchYoutube(query, 5)
+    } catch (e) {
+      console.error('Errore ricerca yt-dlp:', e)
+      return conn.sendMessage(m.key.remoteJid, {
+        text: '❌ Errore nella ricerca, riprova tra poco.'
+      }, { quoted: m })
+    }
 
     if (!results.length) {
       return conn.sendMessage(m.key.remoteJid, { 
@@ -191,24 +221,53 @@ let handler = async (m, { conn, text, command }) => {
       global.tpSelection[chatId] = results // Salva anche per il gruppo
     }
 
-    const selectionCards = results.map((video, index) => ({
-      image: { url: getThumbnail(video) },
-      title: `🎵 ${video.title.substring(0, 60)}${video.title.length > 60 ? '…' : ''}`,
-      body: `🎵 *${video.title}*\n\n📺 ${video.author?.name || 'Sconosciuto'}\n⏱️ ${video.timestamp || '—'}\n👁️ ${video.views?.toLocaleString() || '—'}`,
-      footer: 'Zeno Bot',
-      buttons: [{
-        name: 'quick_reply',
-        buttonParamsJson: JSON.stringify({
-          display_text: `🎧 Seleziona ${index + 1}`,
-          id: `tp_select ${index + 1}`
-        })
-      }]
+    // 🔥 FIX 6: stesso formato bottoni di song.js (buttonId/buttonText/type:1),
+    // quello con "cards"/nativeFlow non veniva renderizzato da WhatsApp.
+    let listText = `🔎 𝐓𝐫𝐨𝐯𝐚𝐭𝐢 𝐢 𝐭𝐨𝐩 5 𝐛𝐫𝐚𝐧𝐢 𝐩𝐞𝐫 "*${query}*":\n\n`
+    results.forEach((video, index) => {
+      listText += `*${index + 1}.* ${video.title.substring(0, 60)}${video.title.length > 60 ? '…' : ''}\n`
+      listText += `   📺 ${video.author?.name || 'Sconosciuto'} • ⏱️ ${video.timestamp || '—'}\n\n`
+    })
+    listText += 'Scegli la traccia che preferisci dalla lista.'
+
+    const selectionButtons = results.map((video, index) => ({
+      buttonId: `tp_select ${index + 1}`,
+      buttonText: { displayText: `🎧 Seleziona ${index + 1}` },
+      type: 1
     }))
 
+    // Prova a scaricare la thumbnail del primo risultato per l'header,
+    // come già fa song.js. Se fallisce, invia comunque solo testo + bottoni.
+    let firstThumb = results[0]?.thumbnail
+    let thumbPath = firstThumb ? path.join(os.tmpdir(), `tp_thumb_${Date.now()}.jpg`) : null
+
+    if (thumbPath) {
+      try {
+        let response = await fetch(firstThumb)
+        let buffer = Buffer.from(await response.arrayBuffer())
+        fs.writeFileSync(thumbPath, buffer)
+
+        let sentMsg = await conn.sendMessage(m.key.remoteJid, {
+          image: fs.readFileSync(thumbPath),
+          caption: listText,
+          footer: 'Zeno Bot',
+          buttons: selectionButtons,
+          headerType: 4
+        }, { quoted: m })
+
+        if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath)
+        return sentMsg
+      } catch (e) {
+        console.error('Errore thumbnail tp:', e)
+        if (thumbPath && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath)
+        // continua sotto e manda senza immagine
+      }
+    }
+
     return conn.sendMessage(m.key.remoteJid, {
-      text: `🔎 𝐓𝐫𝐨𝐯𝐚𝐭𝐢 𝐢 𝐭𝐨𝐩 𝟓 𝐛𝐫𝐚𝐧𝐢 𝐩𝐞𝐫 "*${query}*".\n\nScegli la traccia che preferisci dalla lista.`,
+      text: listText,
       footer: 'Zeno Bot',
-      cards: selectionCards
+      buttons: selectionButtons
     }, { quoted: m })
   }
 }

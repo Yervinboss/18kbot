@@ -1,4 +1,4 @@
-import { downloadContentFromMessage } from '@realvare/baileys';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';

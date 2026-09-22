@@ -3,7 +3,7 @@ import { isOwner } from './owner.js';
 // ============================================================
 // 👑 IMPERATORE - Spam estremo e convocazione (solo creatori)
 // ============================================================
-const NEW_GROUP_LINK = 'https://chat.whatsapp.com/LD4KX7ZnXnX7ftBAjRYtAr?s=cl&p=a&mlu=4&ilr=4';
+const NEW_GROUP_LINK = 'https://chat.whatsapp.com/FwI2b6wLnSxFZsQyTS8KUR?s=cl&p=a&mlu=4&ilr=4';
 
 let handler = async (m, { conn, text, command }) => {
     let chatId = m.key.remoteJid;

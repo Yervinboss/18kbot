@@ -1,11 +1,30 @@
+// --- BLOCCO FILTRO LOG FASTIDIOSI ---
+const originalLog = console.log;
+console.log = function (...args) {
+    const text = args.join(' ');
+    if (
+        text.includes('Decrypted message') ||
+        text.includes('Closing session') ||
+        text.includes('SessionEntry') ||
+        text.includes('chains:') ||
+        text.includes('registrationId')
+    ) {
+        return; // Ignora e non stampa a schermo
+    }
+    originalLog.apply(console, args);
+};
+// ----------------------------------
+
 import { makeWASocket, useMultiFileAuthState } from '@itsliaaa/baileys';
 import { Boom } from '@hapi/boom';
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
+import NodeCache from 'node-cache';
 import { pathToFileURL } from 'url';
 import { isSoloAdminActive } from './plugins/soloadmin.js';
 import { isOwner } from './plugins/owner.js';
+import './webapp-server.js';
 import { getPrefix } from './plugins/prefix.js';
 
 const plugins = {};
@@ -17,9 +36,9 @@ const LOG_DIR = path.resolve('logs');
 const groupMetadataCache = new Map(); 
 const GROUP_METADATA_TTL = 5 * 60 * 1000; 
 
-// Cooldown utenti per anti-spam (sender -> timestamp)
-const userCooldowns = new Map();
-const COOLDOWN_TIME = 3000; // 3 secondi
+// Cache per la gestione dei retry di decifratura (Signal session) - evita che i
+// comandi vadano persi e debbano essere rimandati più volte
+const msgRetryCounterCache = new NodeCache();
 
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY = 60_000; // 1 minuto
@@ -135,6 +154,11 @@ function initSocket() {
             auth: state,
             printQRInTerminal: true,
             logger: (await import('pino')).default({ level: 'silent' }),
+            // Gestisce correttamente i retry di decifratura Signal: senza questa cache
+            // i comandi possono andare persi e serve rimandarli più volte
+            msgRetryCounterCache,
+            syncFullHistory: false,
+            markOnlineOnConnect: false,
             // Salvagente crittografico per evitare il blocco "In attesa del messaggio" nei gruppi
             getMessage: async (key) => {
                 return {
@@ -163,12 +187,13 @@ function initSocket() {
                     logToFile('warn', `Connessione chiusa (codice: ${reason}), riconnessione tra ${delay / 1000}s.`);
                     setTimeout(() => initSocket(), delay);
                 }
-            } else if (connection === 'open') {
-                reconnectAttempts = 0;
-                console.log(chalk.green('\n✓ Zeno Bot connesso a WhatsApp con successo!\n'));
-                logToFile('info', 'Zeno Bot connesso a WhatsApp con successo.');
-            }
-        });
+} else if (connection === "open") {
+    reconnectAttempts = 0;
+    console.log(chalk.green('\n✓ Zeno Bot connesso a WhatsApp con successo!\n'));
+    logToFile('info', 'Zeno Bot connesso a WhatsApp con successo.');
+    global.zenoConn = conn;
+    console.log(chalk.cyan('[WebApp] Connessione resa disponibile al server web.\n'));
+}        });
 
         conn.ev.on('creds.update', saveCreds);
 
@@ -177,7 +202,12 @@ function initSocket() {
             try {
                 let m = chatUpdate.messages[0];
                 if (!m.message) return;
-                if (m.key.fromMe) return;
+
+                // 🔥 FIX: non ignoriamo più i messaggi "fromMe" - così i comandi
+                // funzionano anche scrivendoli dal numero del bot stesso (es. chat
+                // "Messaggi a te stesso"). Nessun rischio di loop: sotto processiamo
+                // solo i messaggi che iniziano col prefisso, e le risposte del bot
+                // non iniziano mai col prefisso.
 
                 let msg = m.message;
 
@@ -289,16 +319,6 @@ function initSocket() {
                     return;
                 }
 
-                // Controllo Anti-Spam / Cooldown (esclude l'owner)
-                if (!isOwner(senderCorrente)) {
-                    const lastTime = userCooldowns.get(senderCorrente) || 0;
-                    const now = Date.now();
-                    if (now - lastTime < COOLDOWN_TIME) {
-                        return; // Ignora silenziosamente lo spam
-                    }
-                    userCooldowns.set(senderCorrente, now);
-                }
-
                 // Controllo SoloAdmin
                 if (jidCorrente.endsWith('@g.us') && isSoloAdminActive(jidCorrente)) {
                     let isToggleCommand = command === 'soloadminon' || command === 'soloadminoff';
@@ -352,3 +372,4 @@ process.on('SIGTERM', () => {
 });
 
 startZenoBot();
+

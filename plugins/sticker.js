@@ -1,4 +1,4 @@
-import { downloadContentFromMessage } from '@realvare/baileys';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import path from 'path';

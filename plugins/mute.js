@@ -3,7 +3,6 @@ import path from 'path';
 import { isOwner } from './owner.js';
 
 const dbPath = path.resolve('database/mutati.json');
-if (!global.pendingMuteActions) global.pendingMuteActions = {};
 
 function getMuted() {
     if (!fs.existsSync(dbPath)) {
@@ -17,12 +16,18 @@ function saveMuted(data) {
     fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
 }
 
-// Estrae solo la parte numerica pura di un ID, ignorando il suffisso
-// @s.whatsapp.net oppure @lid, e ignorando anche il device (":12" dopo il numero).
-// Cosi il confronto funziona sia con JID classici che con i nuovi LID.
+// ✅ Gestisce sia @s.whatsapp.net che @lid
 function pureId(jid) {
     if (!jid) return '';
-    return jid.replace(/[^0-9]/g, '');
+    let str = typeof jid === 'object' ? (jid.id || String(jid)) : String(jid);
+    return str.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
+}
+
+// ✅ Conserva il dominio originale (per menzioni)
+function fullJid(jid) {
+    if (!jid) return '';
+    let str = typeof jid === 'object' ? (jid.id || String(jid)) : String(jid);
+    return str.split(':')[0];
 }
 
 async function isAdmin(conn, jid, sender) {
@@ -37,9 +42,7 @@ async function isAdmin(conn, jid, sender) {
     }
 }
 
-// HOOK GLOBALE: chiamato da main.js per OGNI messaggio in arrivo nei gruppi,
-// non solo per i comandi .mute/.unmute. Se il mittente e nella lista dei
-// mutati di quel gruppo, il suo messaggio viene cancellato automaticamente.
+// HOOK GLOBALE: cancella automaticamente i messaggi degli utenti mutati
 export async function messageHook(conn, m) {
     try {
         let jid = m.key.remoteJid;
@@ -48,7 +51,6 @@ export async function messageHook(conn, m) {
         let sender = m.key.participant;
         if (!sender) return;
 
-        // L'owner del bot non viene mai mutato/cancellato, per sicurezza
         if (isOwner(sender)) return;
 
         let db = getMuted();
@@ -68,107 +70,77 @@ export async function messageHook(conn, m) {
     }
 }
 
-let handler = async (m, { conn, text, command }) => {
+let handler = async (m, { conn, command }) => {
     let jid = m.key.remoteJid;
     if (!jid.endsWith('@g.us')) {
-        return await conn.sendMessage(jid, { text: '❌ Questo comando può essere usato solo nei gruppi!' }, { quoted: m });
+        return conn.sendMessage(jid, { text: '❌ Questo comando può essere usato solo nei gruppi!' }, { quoted: m });
     }
 
     let sender = m.key.participant || m.participant;
     if (!sender && m.key.fromMe) sender = conn.user.id;
 
-    // L'owner del bot bypassa sempre il controllo admin
+    // Controllo admin (owner bypassa)
     if (!isOwner(sender) && !(await isAdmin(conn, jid, sender))) {
-        return await conn.sendMessage(jid, { text: '❌ *Non sei un amministratore!* Solo gli admin possono usare i comandi di mute.' }, { quoted: m });
+        return conn.sendMessage(jid, { text: '❌ *Non sei un amministratore!* Solo gli admin possono usare i comandi di mute.' }, { quoted: m });
     }
 
     let cmd = (command || '').toLowerCase();
 
-    // CONTROLLO ANTI-FURBO: se chi sta scrivendo il comando (anche se admin)
-    // e' attualmente nella lista dei mutati di questo gruppo, non puo' usare
-    // NESSUN comando di mute/unmute, nemmeno per smutare se stesso.
-    // L'owner del bot resta sempre esente da questo controllo.
+    // Anti-furbo: se chi scrive è mutato, non può usare i comandi (tranne owner)
     if (!isOwner(sender)) {
         let db = getMuted();
         let mutedList = db[jid] || [];
         let senderIsMuted = mutedList.some(mutedJid => pureId(mutedJid) === pureId(sender));
-        if (senderIsMuted) {
-            return; // Ignora silenziosamente: un mutato non deve nemmeno sapere come aggirare il mute
-        }
+        if (senderIsMuted) return;
     }
 
-    if (cmd === 'confirmmute' || cmd === 'cancelmute') {
-        let pending = global.pendingMuteActions[jid];
-        if (!pending) {
-            return await conn.sendMessage(jid, { text: '❌ Nessuna richiesta di mute in attesa (potrebbe essere scaduta).' }, { quoted: m });
-        }
-        if (cmd === 'cancelmute') {
-            delete global.pendingMuteActions[jid];
-            return await conn.sendMessage(jid, { text: '❌ Mute annullato.' }, { quoted: m });
-        }
-        let db = getMuted();
-        if (!db[jid]) db[jid] = [];
-        if (!db[jid].some(id => pureId(id) === pureId(pending.target))) {
-            db[jid].push(pending.target);
-            saveMuted(db);
-        }
-        delete global.pendingMuteActions[jid];
-        return await conn.sendMessage(jid, {
-            text: `🔇 *PROVVEDIMENTO DISCIPLINARE:*\nL'utente @${pureId(pending.target)} è stato *mutato*.`,
-            mentions: [pending.target]
-        }, { quoted: m });
+    // Recupera il target (reply o menzione)
+    let target = m.message?.extendedTextMessage?.contextInfo?.participant;
+    if (!target && m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
+        target = m.message.extendedTextMessage.contextInfo.mentionedJid[0];
     }
 
+    // === UNMUTE ===
     if (cmd === 'unmute') {
-        let target = m.message?.extendedTextMessage?.contextInfo?.participant;
-        if (!target && m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
-            target = m.message.extendedTextMessage.contextInfo.mentionedJid[0];
-        }
         if (!target) {
-            return await conn.sendMessage(jid, { text: `❌ Per usare .unmute, rispondi a un messaggio dell'utente o taggalo!` }, { quoted: m });
+            return conn.sendMessage(jid, { text: `❌ Per usare .unmute, rispondi a un messaggio dell'utente o taggalo!` }, { quoted: m });
         }
         let db = getMuted();
         if (!db[jid]) db[jid] = [];
         db[jid] = db[jid].filter(id => pureId(id) !== pureId(target));
         saveMuted(db);
-        return await conn.sendMessage(jid, {
+        return conn.sendMessage(jid, {
             text: `🔊 L'utente @${pureId(target)} è stato *smutato* e può tornare a scrivere.`,
-            mentions: [target]
+            mentions: [fullJid(target)]
         }, { quoted: m });
     }
 
+    // === MUTE ===
     if (cmd === 'mute') {
-        let target = m.message?.extendedTextMessage?.contextInfo?.participant;
-        if (!target && m.message?.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
-            target = m.message.extendedTextMessage.contextInfo.mentionedJid[0];
-        }
         if (!target) {
-            return await conn.sendMessage(jid, { text: `❌ Per usare .mute, rispondi a un messaggio dell'utente o taggalo!` }, { quoted: m });
+            return conn.sendMessage(jid, { text: `❌ Per usare .mute, rispondi a un messaggio dell'utente o taggalo!` }, { quoted: m });
         }
 
-        // Protezione: non si puo mutare l'owner del bot
         if (isOwner(target)) {
-            return await conn.sendMessage(jid, { text: '🧠 Non puoi mutare il creatore del bot!' }, { quoted: m });
+            return conn.sendMessage(jid, { text: '🧠 Non puoi mutare il creatore del bot!' }, { quoted: m });
         }
 
-        global.pendingMuteActions[jid] = { target: target };
+        let db = getMuted();
+        if (!db[jid]) db[jid] = [];
+        if (!db[jid].some(id => pureId(id) === pureId(target))) {
+            db[jid].push(fullJid(target));
+            saveMuted(db);
+        }
 
-        let buttons = [
-            { buttonId: 'confirmmute', buttonText: { displayText: '🔇 Conferma Mute' }, type: 1 },
-            { buttonId: 'cancelmute', buttonText: { displayText: '❌ Annulla' }, type: 1 }
-        ];
-
-        let buttonMessage = {
-            text: `⚠️ Vuoi mutare @${pureId(target)}?`,
-            footer: 'Zeno Bot - Moderazione',
-            buttons: buttons,
-            headerType: 1,
-            mentions: [target]
-        };
-
-        return await conn.sendMessage(jid, buttonMessage, { quoted: m });
+        return conn.sendMessage(jid, {
+            text: `🔇 *PROVVEDIMENTO DISCIPLINARE:*\nL'utente @${pureId(target)} è stato *mutato*.`,
+            mentions: [fullJid(target)]
+        }, { quoted: m });
     }
 };
 
-handler.command = /^(mute|unmute|confirmmute|cancelmute)$/i;
+handler.help = ['mute [@tag / rispondi]', 'unmute [@tag / rispondi]'];
+handler.tags = ['admin'];
+handler.command = /^(mute|unmute)$/i;
+
 export default handler;

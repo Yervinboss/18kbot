@@ -1,4 +1,4 @@
-import { downloadContentFromMessage } from '@realvare/baileys';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 import { isOwner } from './owner.js';
 
 function pureId(jid) {

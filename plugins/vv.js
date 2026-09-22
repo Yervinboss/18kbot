@@ -101,7 +101,7 @@ let handler = async (m, { conn, text, command }) => {
 
         // Metodo Alternativo se il precedente fallisce o restituisce errore di cifratura
         if (!buffer) {
-            const rv = await import('@realvare/baileys').catch(() => null);
+            const rv = await import('@whiskeysockets/baileys').catch(() => null);
             let downloadFn = rv?.downloadContentFromMessage || rv?.default?.downloadContentFromMessage;
 
             if (downloadFn) {

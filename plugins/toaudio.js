@@ -2,7 +2,7 @@ import { exec } from 'child_process';
 import util from 'util';
 import fs from 'fs';
 import path from 'path';
-import { downloadContentFromMessage } from '@realvare/baileys';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 
 const execPromise = util.promisify(exec);
 

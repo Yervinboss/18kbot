@@ -1,4 +1,4 @@
-import { proto } from '@realvare/baileys';
+import { proto } from '@whiskeysockets/baileys';
 import { isOwner } from './owner.js';
 
 function pureId(jid) {

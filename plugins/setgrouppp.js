@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { isOwner } from './owner.js';
-import { downloadContentFromMessage } from '@realvare/baileys';
+import { downloadContentFromMessage } from '@whiskeysockets/baileys';
 
 async function downloadMedia(mediaMessage, type) {
     let stream = await downloadContentFromMessage(mediaMessage, type);

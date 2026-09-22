@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
-import pkg from '@realvare/baileys';
+import pkg from '@whiskeysockets/baileys';
 const { downloadMediaMessage, proto } = pkg;
 
 const __filename = fileURLToPath(import.meta.url);

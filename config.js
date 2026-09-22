@@ -1,4 +1,5 @@
-global.owner = ['393513673426@s.whatsapp.net'];
+global.owner = ['26496123052225@lid'];
 global.namaBot = 'Zeno Bot';
 
 export default global;
+

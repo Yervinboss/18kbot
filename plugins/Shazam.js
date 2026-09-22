@@ -5,30 +5,19 @@ import { exec } from 'child_process';
 import util from 'util';
 import { fileURLToPath } from 'url';
 import yts from 'yt-search';
-import { downloadContentFromMessage } from '@realvare/baileys';
-import { isOwner } from './owner.js';
+import { downloadContentFromMessage } from '@itsliaaa/baileys';
+import { Shazam } from 'node-shazam';
 
 const execPromise = util.promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const configPath = path.resolve('database/shazam.json');
 const shazamMusicDbPath = path.join(__dirname, 'shazam_music_db.json');
 const playlistDbPath = path.join(__dirname, '../playlist_db.json');
 
+const shazam = new Shazam();
+
 const makeMessageID = () => 'ZENO' + crypto.randomBytes(8).toString('hex').toUpperCase();
-
-function getConfig() {
-    if (!fs.existsSync(configPath)) {
-        fs.mkdirSync(path.dirname(configPath), { recursive: true });
-        fs.writeFileSync(configPath, JSON.stringify({ apiKey: '' }));
-    }
-    try { return JSON.parse(fs.readFileSync(configPath, 'utf-8')); } catch (e) { return { apiKey: '' }; }
-}
-
-function saveConfig(data) {
-    fs.writeFileSync(configPath, JSON.stringify(data, null, 2));
-}
 
 function readMusicDB() {
     if (!fs.existsSync(shazamMusicDbPath)) return {};
@@ -98,20 +87,6 @@ let handler = async (m, { conn, text, command }) => {
         cmd = buttonId.trim().toLowerCase();
     }
 
-    if (cmd === 'setshazamkey') {
-        if (!isOwner(sender)) {
-            return await conn.sendMessage(jid, { text: '❌ Solo il creatore del bot può impostare la chiave API.' }, { quoted: m });
-        }
-        let key = (text || '').trim();
-        if (!key) {
-            return await conn.sendMessage(jid, { text: '❌ Scrivi la chiave API dopo il comando.\nEsempio: `.setshazamkey abc123...`' }, { quoted: m });
-        }
-        let config = getConfig();
-        config.apiKey = key;
-        saveConfig(config);
-        return await conn.sendMessage(jid, { text: '✅ Chiave API di riconoscimento musicale impostata correttamente!' }, { quoted: m });
-    }
-
     if (cmd === 'shazam_add_pl') {
         let musicDb = readMusicDB();
         let trackData = musicDb[jid];
@@ -139,7 +114,7 @@ let handler = async (m, { conn, text, command }) => {
         });
 
         writePlaylistDB(plDb);
-        return await conn.sendMessage(jid, { text: `✅ Brano aggiunto con successo alla tua playlist (.pl)!\n🎵 *{targetTitle}*` }, { quoted: m });
+        return await conn.sendMessage(jid, { text: `✅ Brano aggiunto con successo alla tua playlist (.pl)!\n🎵 *${targetTitle}*` }, { quoted: m });
     }
 
     if (cmd === 'shazam_play') {
@@ -198,11 +173,6 @@ let handler = async (m, { conn, text, command }) => {
     }
 
     if (cmd === 'shazam') {
-        let config = getConfig();
-        if (!config.apiKey) {
-            return await conn.sendMessage(jid, { text: '❌ Nessuna chiave API impostata.\nUsa `.setshazamkey <chiave>` (disponibile su https://audd.io)' }, { quoted: m });
-        }
-
         let quoted = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
         if (quoted?.viewOnceMessage?.message) quoted = quoted.viewOnceMessage.message;
         else if (quoted?.viewOnceMessageV2?.message) quoted = quoted.viewOnceMessageV2.message;
@@ -233,35 +203,35 @@ let handler = async (m, { conn, text, command }) => {
 
             if (!fs.existsSync(tmpMp3)) throw new Error('Estrazione audio fallita');
 
-            let formData = new FormData();
-            formData.append('api_token', config.apiKey);
-            formData.append('file', new Blob([fs.readFileSync(tmpMp3)]), 'audio.mp3');
-            formData.append('return', 'apple_music,spotify');
+            // 🔥 FIX: niente più audd.io/apiKey - usiamo node-shazam (gratuito).
+            let recognise = await shazam.recognise(tmpMp3, 'it-IT');
 
-            let response = await fetch('https://api.audd.io/', { method: 'POST', body: formData });
-            let result = await response.json();
+            let track = recognise?.track || recognise;
 
-            if (result.status !== 'success' || !result.result) {
+            if (!track || (Array.isArray(recognise?.matches) && recognise.matches.length === 0)) {
                 await conn.sendMessage(jid, { react: { text: '❌', key: m.key } });
                 return await conn.sendMessage(jid, { text: '❌ Non sono riuscito a riconoscere questa canzone.' }, { quoted: m });
             }
 
-            let song = result.result;
+            let title = track?.title || track?.name || 'Sconosciuto';
+            let artist = track?.subtitle || track?.artist || track?.artists?.[0]?.alias || 'Sconosciuto';
+            let album = track?.sections?.find?.(s => s?.metadata)?.metadata?.find?.(md => md?.title === 'Album')?.text;
+
             let txt = `🎧 *ZENO SHAZAM*\n\n`;
-            txt += `🎵 *Titolo:* ${song.title}\n`;
-            txt += `🎤 *Artista:* ${song.artist}\n`;
-            if (song.album) txt += `💿 *Album:* ${song.album}\n`;
+            txt += `🎵 *Titolo:* ${title}\n`;
+            txt += `🎤 *Artista:* ${artist}\n`;
+            if (album) txt += `💿 *Album:* ${album}\n`;
 
             await conn.sendMessage(jid, { react: { text: '🎵', key: m.key } });
 
             let hasPlayButton = false;
             try {
-                let search = await yts(`${song.artist} ${song.title}`);
+                let search = await yts(`${artist} ${title}`);
                 if (search?.videos?.length > 0) {
                     let musicDb = readMusicDB();
                     musicDb[jid] = {
                         url: search.videos[0].url,
-                        title: `${song.artist} - ${song.title}`,
+                        title: `${artist} - ${title}`,
                         duration: search.videos[0].timestamp || '--:--'
                     };
                     writeMusicDB(musicDb);
@@ -290,8 +260,9 @@ let handler = async (m, { conn, text, command }) => {
     }
 };
 
-handler.command = /^(shazam|setshazamkey|shazam_play|shazam_add_pl)$/i;
-handler.help = ['shazam', 'setshazamkey'];
+handler.command = /^(shazam|shazam_play|shazam_add_pl)$/i;
+handler.help = ['shazam'];
 handler.tags = ['fun'];
 
 export default handler;
+

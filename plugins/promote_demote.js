@@ -2,7 +2,8 @@ import { isOwner } from './owner.js';
 
 function pureId(jid) {
     if (!jid) return '';
-    return jid.replace(/[^0-9]/g, '');
+    let str = typeof jid === 'object' ? (jid.id || jid.remoteJid || String(jid)) : String(jid);
+    return str.replace(/[^0-9]/g, '');
 }
 
 async function isAdmin(conn, jid, sender) {
@@ -33,10 +34,10 @@ let handler = async (m, { conn, command }) => {
     }
 
     let who = false;
-    if (m.mentionedJid && m.mentionedJid) {
-        who = m.mentionedJid;
-    } else if (m.message?.extendedTextMessage?.contextInfo?.mentionedJid && m.message.extendedTextMessage.contextInfo.mentionedJid) {
-        who = m.message.extendedTextMessage.contextInfo.mentionedJid;
+    if (m.mentionedJid && m.mentionedJid.length > 0) {
+        who = m.mentionedJid[0];
+    } else if (m.message?.extendedTextMessage?.contextInfo?.mentionedJid && m.message.extendedTextMessage.contextInfo.mentionedJid.length > 0) {
+        who = m.message.extendedTextMessage.contextInfo.mentionedJid[0];
     } else if (m.quoted && m.quoted.sender) {
         who = m.quoted.sender;
     } else if (m.message?.extendedTextMessage?.contextInfo?.participant) {
@@ -54,33 +55,35 @@ let handler = async (m, { conn, command }) => {
     if (targetId === pureId(conn.user.id)) return await conn.sendMessage(jid, { text: '❌ Impossibile modificare i permessi del bot stesso!' }, { quoted: m });
     if (isOwner(who) && !isCmdOwner) return await conn.sendMessage(jid, { text: '❌ Non puoi togliere i permessi a un proprietario globale del bot!' }, { quoted: m });
 
-    // 1. REAZIONE INIZIALE: Clessidra
     await conn.sendMessage(jid, { react: { text: '⏳', key: m.key } });
 
     try {
         let msgText = '';
 
+        // Cerchiamo di prender l'ID esatto dalla lista dei partecipanti del gruppo per sicurezza
+        let groupMetadata = await conn.groupMetadata(jid);
+        let participantObj = groupMetadata.participants.find(p => pureId(p.id) === targetId);
+        let finalTarget = participantObj ? participantObj.id : targetJid;
+
         if (cmd === 'p') {
-            await conn.groupParticipantsUpdate(jid, [targetJid], 'promote');
+            await conn.groupParticipantsUpdate(jid, [finalTarget], 'promote');
             msgText = `⚡ @${targetId} *È DIVENTATO UN DIO!* 👑`;
         } else if (cmd === 'd') {
-            await conn.groupParticipantsUpdate(jid, [targetJid], 'demote');
+            await conn.groupParticipantsUpdate(jid, [finalTarget], 'demote');
             msgText = `☠️ @${targetId} *È RITORNATO UN COMUNE MORTALE!* 📉`;
         }
 
-        // 2. REAZIONE FINALE: Spunta verde sul comando
         await conn.sendMessage(jid, { react: { text: '✅', key: m.key } });
 
-        // Invia il verdetto pulito taggando l'utente
         return await conn.sendMessage(jid, { 
             text: msgText,
-            mentions: [targetJid]
+            mentions: [finalTarget]
         }, { quoted: m });
 
     } catch (e) {
         console.error('Errore modifica privilegi:', e);
         await conn.sendMessage(jid, { react: { text: '❌', key: m.key } });
-        return await conn.sendMessage(jid, { text: '❌ Errore: Assicurati che Zero Bot sia *Amministratore* del gruppo!' }, { quoted: m });
+        return await conn.sendMessage(jid, { text: '❌ Errore interno di WhatsApp. Riprova tra poco.' }, { quoted: m });
     }
 };
 
