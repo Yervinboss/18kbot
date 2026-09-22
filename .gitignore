@@ -4,3 +4,20 @@ Database/
 *.mp3
 tmp_*
 *.json
+database/
+logs/
+tmp/
+ngrok
+ngrok-v3-stable-linux-*
+webapp-server.js database/
+logs/
+tmp/
+ngrok
+ngrok-v3-stable-linux-*
+webapp-server.js
+database/
+logs/
+tmp/
+ngrok
+ngrok-v3-stable-linux-*
+webapp-server.js
