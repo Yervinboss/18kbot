@@ -9,15 +9,4 @@ logs/
 tmp/
 ngrok
 ngrok-v3-stable-linux-*
-webapp-server.js database/
-logs/
-tmp/
-ngrok
-ngrok-v3-stable-linux-*
-webapp-server.js
-database/
-logs/
-tmp/
-ngrok
-ngrok-v3-stable-linux-*
 webapp-server.js
